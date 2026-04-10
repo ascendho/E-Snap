@@ -40,3 +40,6 @@ share/python-wheels/
 
 # Redis dumps (if running locally in the folder)
 dump.rdb
+
+# Gradio Server Config / Proxy Certificates
+.gradio/
