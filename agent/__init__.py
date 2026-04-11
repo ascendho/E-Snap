@@ -419,8 +419,8 @@ def analyze_agent_results(results):
     
     # 自动保存分析结果图表
     import os
-    os.makedirs("output_images", exist_ok=True)
-    save_path = "output_images/performance_analysis.png"
+    os.makedirs("outputs", exist_ok=True)
+    save_path = "outputs/performance_analysis.png"
     plt.savefig(save_path, dpi=300)
     logger.info(f"📊 可视化图已保存到: {save_path}")
 

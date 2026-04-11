@@ -43,3 +43,6 @@ dump.rdb
 
 # Gradio Server Config / Proxy Certificates
 .gradio/
+
+# 忽略运行产物
+outputs/

@@ -2,7 +2,7 @@ from typing import Any, Dict
 
 from agent import analyze_agent_results, display_results, run_agent
 from cache.evals import PerfEval, format_cost
-from scenarios import SCENARIO_RUNS
+from .scenarios import SCENARIO_RUNS
 from utility.results_export import export_results
 
 

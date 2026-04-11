@@ -1,77 +1,100 @@
-# 带有语义缓存的高效 AI Agent (Fast AI Agents with a Semantic Cache)
+# 带有语义缓存的高效 AI Agent
 
-本项目实现了一个高级的 AI Agentic 工作流，综合使用了 [LangGraph](https://python.langchain.com/docs/langgraph) 和由 [RedisVL](https://github.com/RedisVentures/redisvl) 支持的语义缓存（Semantic Cache）。它通过存储和复用过去对语义相似查询的响应，大幅优化了 API 请求成本并降低了响应延迟。
-
-## 核心特性
-- **LangGraph Agent 工作流**: 智能地将复杂查询分解为子问题、检查缓存、通过 LLM 进行资料检索和研究、评估回答的质量，并最终综合生成完整的响应。
-- **语义缓存 (Semantic Caching)**: 利用 `redisvl` 和本地 HuggingFace 嵌入模型 (`all-MiniLM-L6-v2`) 搜索并检索以前对相同或高度相似用户查询的回答。
-- **大模型与追踪系统**: LLM 推理基于字节跳动火山引擎 (ARK) 提供支持，同时可选开启 LangSmith 对 Agent 的所有推理步骤和链路进行追踪监控。
+本项目实现了一个基于 LangGraph + RedisVL 语义缓存的 Agent 工作流。
+目标是通过语义命中复用，降低重复问题的 LLM 成本并提升响应效率。
 
 ## 前置要求
 
-1. **Python 3.9+**
-2. **本地 Redis 服务:** 确保本地已启动 Redis 服务并监听在 `6379` 端口。你可以通过 Docker 非常方便地启动一个实例：
-    ```bash
-    docker run -d -p 6379:6379 redis
-    ```
+1. Python 3.11+（推荐）
+2. 本机已安装并可启动 Redis（监听 `localhost:6379`）
+3. 可用的 ARK API Key
 
-## 安装与配置
+## 快速启动
 
-### 1. 克隆仓库
-```bash
-git clone <your-github-repo-url>
-cd agentCache
-```
+### 1) 创建并激活虚拟环境
 
-### 2. 设置虚拟环境
-强烈推荐使用 Python 虚拟环境 (`.venv`) 来隔离项目依赖。
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
+python -m pip install --upgrade pip
 ```
 
-### 3. 安装依赖
+### 2) 安装依赖
+
 ```bash
 pip install -r requirements.txt
 ```
 
-### 4. 配置环境变量
-在项目根目录创建一个名为 `.env` 的文件，填入你的 API 密钥：
+### 3) 安装并启动 Redis（针对 macOS 系统）
 
-> **避坑提醒**: 在 `.env` 中填写 API Key 时，**千万不要**在前后加反引号 (`` ` ``) 或单引号 (`'`)，除非你的密钥本身包含空格等特殊字符。直接粘贴纯文本即可。
+如果你用 Homebrew：
+
+```bash
+brew install redis
+brew services start redis
+redis-cli ping
+```
+
+`redis-cli ping` 返回 `PONG` 表示 Redis 已正常启动。
+
+如果你不想用服务模式，也可以前台启动：
+
+```bash
+redis-server
+```
+
+### 4) 配置环境变量（`.env`）
+
+在项目根目录新建 `.env` 文件，写入以下内容：
 
 ```env
-# Redis 配置
+# Redis
 REDIS_URL=redis://localhost:6379
 CACHE_NAME=semantic-cache
 CACHE_DISTANCE_THRESHOLD=0.3
 CACHE_TTL_SECONDS=3600
 
-# 火山引擎 (ARK) API Key (运行代码必需)
+# 运行必需：火山引擎 ARK
 ARK_API_KEY=your_ark_api_key_here
 
-# 搜索引擎 API Key (如果用到 Tavily 搜索代理)
+# 可选：如果你使用 Tavily 检索
 TAVILY_API_KEY=your_tavily_api_key_here
 
-# LangSmith 追踪 (可选)
+# 可选：LangSmith 链路追踪
 LANGCHAIN_TRACING_V2=true
 LANGCHAIN_API_KEY=your_langsmith_key_here
 ```
 
-## 运行项目
+注意：API Key 直接填纯文本，不要额外加引号。
 
-### 选项 A: 运行标准 Python 脚本（推荐作为项目展示）
-你可以直接在终端中自动执行主 LangGraph 工作流跑完所有的测试场景（Scenarios）。这是面试或展示给别人看最直观的运行方式。
+### 5) 运行项目
+
 ```bash
 python main.py
 ```
 
-### 选项 B: 交互式 Jupyter Notebook
-如果你想一步一步地学习其原理并可视化交互，可以用 VS Code 或 Jupyter 原生打开 `L5.ipynb` 文件，依次执行单元格。
+可选：如果你希望同时在控制台打印每个场景的结果：
 
-## 项目结构说明
-- `main.py` - 主执行入口脚本，包含核心逻辑和完整的场景演示流程。
-- `L5.ipynb` - 本项目的交互式 Jupyter Notebook 版本（作为学习备份）。
-- `agent/` - 包含 LangGraph 的状态定义、节点 (nodes) 逻辑和工具路由配置。
-- `cache/` - 语义缓存的核心工具封装和配置。
-- `data/` - 包含用于 FAQ 向量检索知识库的初始测试数据集 (CSV等)。
+```bash
+SHOW_CONSOLE_RESULTS=true python main.py
+```
+
+## 输出结果
+
+运行后会在 `outputs/` 下生成：
+
+1. 场景汇总 CSV
+2. LLM 调用明细 CSV
+3. 全量结果 JSON
+
+说明：以上文件名为固定名称（`run_summary.csv`、`llm_usage.csv`、`run_results.json`），每次运行会覆盖上一次结果，不会累积历史文件。
+
+## 当前结构（核心）
+
+1. `main.py`: 唯一入口，负责启动流程
+2. `app/bootstrap.py`: 知识库初始化
+3. `cache/bootstrap.py`: 语义缓存初始化（含 `hydrate` 预热）
+4. `app/scenarios.py`: 场景定义
+5. `app/workflow_runner.py`: 场景执行、成本统计、导出与分析
+6. `agent/`: LangGraph 节点、边、工具与工作流编排
+7. `cache/`: 语义缓存封装、评估与配置

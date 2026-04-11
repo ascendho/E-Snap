@@ -1,13 +1,12 @@
 import csv
 import json
 import os
-from datetime import datetime
 from typing import Dict, List
 
 from cache.evals import PerfEval
 
 
-def export_results(all_results: List[Dict], total_costs: Dict, output_dir: str = "output_images") -> Dict[str, str]:
+def export_results(all_results: List[Dict], total_costs: Dict, output_dir: str = "outputs") -> Dict[str, str]:
     """
     将运行结果导出为 CSV + JSON 文件，便于后续分析与归档。
 
@@ -15,11 +14,10 @@ def export_results(all_results: List[Dict], total_costs: Dict, output_dir: str =
         导出文件路径字典。
     """
     os.makedirs(output_dir, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    summary_csv = os.path.join(output_dir, f"run_summary_{ts}.csv")
-    usage_csv = os.path.join(output_dir, f"llm_usage_{ts}.csv")
-    result_json = os.path.join(output_dir, f"run_results_{ts}.json")
+    summary_csv = os.path.join(output_dir, "run_summary.csv")
+    usage_csv = os.path.join(output_dir, "llm_usage.csv")
+    result_json = os.path.join(output_dir, "run_results.json")
 
     # 场景级汇总：每条主查询一行。
     with open(summary_csv, "w", newline="", encoding="utf-8") as f:
@@ -105,7 +103,6 @@ def export_results(all_results: List[Dict], total_costs: Dict, output_dir: str =
                 )
 
     payload = {
-        "generated_at": datetime.now().isoformat(),
         "cost_summary": total_costs,
         "results": all_results,
     }
