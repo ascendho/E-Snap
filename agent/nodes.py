@@ -52,6 +52,7 @@ class WorkflowState(TypedDict):
     answer: str
     final_response: Optional[str]
     cache_hit: bool
+    cache_matched_question: Optional[str]
     cache_confidence: float
     cache_seed_id: Optional[int]
     cache_enabled: bool
@@ -101,6 +102,7 @@ def check_cache_node(state: WorkflowState) -> WorkflowState:
     if not state.get("cache_enabled", True) or not _cache_instance:
         logger.info("   ⚠️ 缓存未启用或未初始化")
         cache_hit = False
+        cache_matched_question = None
         cache_confidence = 0.0
         cache_seed_id = None
         answer = ""
@@ -109,12 +111,14 @@ def check_cache_node(state: WorkflowState) -> WorkflowState:
         if results.matches:
             best_match = results.matches[0]
             cache_hit = True
+            cache_matched_question = best_match.prompt
             cache_confidence = best_match.cosine_similarity
             cache_seed_id = best_match.seed_id
             answer = best_match.response
-            logger.info(f"   ✅ 缓存命中 ({cache_confidence:.3f}): '{query}'")
+            logger.info(f"   ✅ 缓存命中 ({cache_confidence:.3f}): '{query}' -> 匹配到了 '{cache_matched_question}'")
         else:
             cache_hit = False
+            cache_matched_question = None
             cache_confidence = 0.0
             cache_seed_id = None
             answer = ""
@@ -134,6 +138,7 @@ def check_cache_node(state: WorkflowState) -> WorkflowState:
         **state,
         "answer": answer,
         "cache_hit": cache_hit,
+        "cache_matched_question": cache_matched_question,
         "cache_confidence": cache_confidence,
         "cache_seed_id": cache_seed_id,
         "execution_path": state["execution_path"] + ["cache_checked"],

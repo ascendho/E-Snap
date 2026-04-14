@@ -67,7 +67,7 @@ class SemanticCacheWrapper:
         self.embeddings_cache = EmbeddingsCache(redis_client=self.redis, ttl=ttl * 24)
         
         # 初始化“翻译官”模型，并挂载刚刚创建的向量特征缓存
-        self.langcache_embed = HFTextVectorizer(model="redis/langcache-embed-v1", cache=self.embeddings_cache)
+        self.langcache_embed = HFTextVectorizer(model="BAAI/bge-large-zh-v1.5", cache=self.embeddings_cache)
         
         # 初始化第 2 层缓存：核心的智能体语义缓存
         self.cache = SemanticCache(
@@ -100,7 +100,11 @@ class SemanticCacheWrapper:
         """
         # 1. 重置缓存池，防止旧版本脏数据污染
         if clear:
-            self.cache.clear()
+            # 物理清空整个向量索引和相关数据（只针对语义缓存，不影响知识库库）
+            if self.cache.index.exists():
+                self.cache.index.delete(drop=True)
+            self.cache.index.create(overwrite=True, drop=False)
+            self.embeddings_cache.clear()
             
         self._seed_id_by_question = {}
         question_to_id: Dict[str, int] = {}

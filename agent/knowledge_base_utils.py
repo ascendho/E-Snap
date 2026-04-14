@@ -31,7 +31,7 @@ class KnowledgeBaseManager:
         """
         self.redis_client = redis_client
         # 默认使用 sentence-transformers 模型进行文本向量化
-        self.embeddings = embeddings or HFTextVectorizer(model="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
+        self.embeddings = embeddings or HFTextVectorizer(model="BAAI/bge-large-zh-v1.5")
         # 用于跟踪当前活跃的索引（以 URL 的哈希值为键）
         self.active_indexes = {} 
     
@@ -112,7 +112,7 @@ class KnowledgeBaseManager:
                 return False, f"Unsupported content type: {type(content)}", None
             
             # --- 步骤 2: 定义 Redis 向量索引 Schema ---
-            # 包含：文本内容、来源 ID、来源类型、切片索引以及 384 维的向量字段
+            # 包含：文本内容、来源 ID、来源类型、切片索引以及 1024 维的向量字段
             schema = {
                 "index": {"name": index_name, "prefix": f"kb:{source_hash}:"},
                 "fields": [
@@ -128,7 +128,7 @@ class KnowledgeBaseManager:
                         "name": "content_vector",
                         "type": "vector",
                         "attrs": {
-                            "dims": 384,                  # 向量维度（对应 all-MiniLM-L6-v2）
+                            "dims": 1024,                  # 向量维度 (bge-large-zh-v1.5)
                             "distance_metric": "cosine",  # 距离算法：余弦相似度
                             "algorithm": "hnsw",          # 算法：HNSW (适合高维度、高性能检索)
                             "datatype": "float32",
