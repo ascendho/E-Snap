@@ -68,7 +68,6 @@ class KnowledgeBaseManager:
             source_hash = hashlib.md5(source_id.encode()).hexdigest()[:8]
             index_name = f"kb-{source_hash}"
             
-            # 此函数里面的分块逻辑可以考虑去除？
             # --- 步骤 1: 文本预处理与标准化 ---
             if isinstance(content, list):
                 # 处理列表输入（通常是已经手动切分并带有元数据的数据）

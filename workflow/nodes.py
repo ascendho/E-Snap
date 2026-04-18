@@ -181,24 +181,12 @@ def research_node(state: WorkflowState) -> WorkflowState:
     
     # 如果有反馈信息，则构建一个带引导的 Prompt，要求 LLM 调整策略
     if feedback:
-        research_prompt = f"""
-请针对以下问题进行检索和回答：
-问题：{query}
-
-之前尝试检索失败或效果不佳，收到了以下反馈：
-{feedback}
-
-请调整你的搜索关键词或策略，如果需要请多次分步骤调用重试，利用知识库尽力搜寻信息，并给出完整准确的答案。
-如果确实找不到相关规定，就回答“目前知识库中没有记录关于此问题的具体规定”。
-        """
+        from workflow.prompts import RESEARCH_PROMPT_WITH_FEEDBACK
+        research_prompt = RESEARCH_PROMPT_WITH_FEEDBACK.format(query=query, feedback=feedback)
     else:
         # 初次尝试的 Prompt
-        research_prompt = f"""
-请针对以下问题进行研究：
-问题：{query}
-
-请使用提供的检索工具从知识库查找信息并给出准确完整的答案。如果相关政策有前提条件或特例，请一并说明。
-        """
+        from workflow.prompts import RESEARCH_PROMPT_INITIAL
+        research_prompt = RESEARCH_PROMPT_INITIAL.format(query=query)
 
     # 绑定工具到 LLM
     llm_with_tools = get_research_llm().bind_tools(tools)
@@ -265,14 +253,8 @@ def evaluate_quality_node(state: WorkflowState) -> WorkflowState:
     answer = state["answer"]          # 检索出来的答案
     
     # 构建评估 Prompt，要求输出特定的结构化格式
-    eval_prompt = f"""
-请评估以下回答是否充分解答了问题。
-如果知识库明确涵盖了这个问题并给出了答案，那么是合格的。
-如果回答是"我在知识库里没找到"，也是合格的（说明确实没信息，无需再找）。
-
-问题：{query}
-生成的回答：{answer}
-    """
+    from workflow.prompts import EVAL_PROMPT
+    eval_prompt = EVAL_PROMPT.format(query=query, answer=answer)
     
     try:
         # 调用分析专用 LLM，使用 structured output 强类型约束
