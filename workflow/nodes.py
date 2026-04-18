@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, TypedDict  # 导入类型提示，
 from langchain_core.messages import HumanMessage  # 导入 LangChain 的人类消息对象
 from langchain_openai import ChatOpenAI           # 导入 LangChain 的 OpenAI 兼容模型接口
 from workflow.tools import search_knowledge_base  # 导入自定义的知识库检索工具
+from common.env import CACHE_DISTANCE_THRESHOLD, ARK_BASE_URL, ANALYSIS_MODEL_NAME, RESEARCH_MODEL_NAME
 
 # 获取名为 "agentic-workflow" 的日志记录器
 logger = logging.getLogger("agentic-workflow")
@@ -21,11 +22,11 @@ def get_analysis_llm():
     # 如果尚未初始化
     if _analysis_llm is None:  
         _analysis_llm = ChatOpenAI(
-            model="ep-m-20260411093114-9hftc",                   # 指定模型端点 ID
+            model=ANALYSIS_MODEL_NAME,
             temperature=0.1,                                     # 设置低随机性，确保评估结果稳定
             max_tokens=400,                                      # 限制输出长度
             api_key=os.getenv("ARK_API_KEY"),                    # 从环境变量获取 API 密钥
-            base_url="https://ark.cn-beijing.volces.com/api/v3"  # 指向火山引擎提供的 API 地址
+            base_url=ARK_BASE_URL
         )
     return _analysis_llm
 
@@ -35,11 +36,11 @@ def get_research_llm():
     # 如果尚未初始化
     if _research_llm is None:  
         _research_llm = ChatOpenAI(
-            model="deepseek-v3-2-251201",                        # 指定使用 DeepSeek 模型
+            model=RESEARCH_MODEL_NAME,
             temperature=0.2,                                     # 设置适度的创造性
             max_tokens=400,                                      # 限制输出长度
             api_key=os.getenv("ARK_API_KEY"),                    # 共享 API 密钥
-            base_url="https://ark.cn-beijing.volces.com/api/v3"  # 指向 API 基础路径
+            base_url=ARK_BASE_URL
         )
     return _research_llm
 
@@ -124,10 +125,9 @@ def check_cache_node(state: WorkflowState) -> WorkflowState:
         cache_seed_id = None
         answer = ""
     else:
-        # 在 Redis 中执行语义检索，设定阈值为 0.2
-
-        # 这里阈值是硬编码的！！！！也可以根据实际需求调整或动态设置，统一一下
-        results = _cache_instance.check(query, distance_threshold=0.2)
+        # 在 Redis 中执行语义检索，设定阈值从 env 读取
+        from common.env import CACHE_DISTANCE_THRESHOLD
+        results = _cache_instance.check(query, distance_threshold=CACHE_DISTANCE_THRESHOLD)
         if results.matches:  # 如果找到了足够相似的历史记录
             best_match = results.matches[0]
             cache_hit = True
@@ -252,6 +252,12 @@ def research_node(state: WorkflowState) -> WorkflowState:
         "metrics": metrics,
     }
 
+from pydantic import BaseModel, Field
+
+class QualityEvaluation(BaseModel):
+    score: float = Field(description="研究结果质量分数，从 0.0 到 1.0")
+    feedback: str = Field(description="如果分数低于0.7，给出如何改进搜索策略的建议，否则写'OK'")
+
 def evaluate_quality_node(state: WorkflowState) -> WorkflowState:
     """节点：对研究结果进行质量评估"""
     start_time = time.perf_counter()  # 记录开始时间
@@ -266,31 +272,19 @@ def evaluate_quality_node(state: WorkflowState) -> WorkflowState:
 
 问题：{query}
 生成的回答：{answer}
-
-请严格按如下格式输出单行结果：
-SCORE: [0.0-1.0的分数]
-FEEDBACK: [如果分数低于0.7，给出如何改进搜索策略的建议，否则写OK]
-"""
+    """
     
-    # 调用分析专用 LLM 执行评估
-    response = get_analysis_llm().invoke([HumanMessage(content=eval_prompt)])
-    content = response.content.strip()
-    
-    score = 1.0        # 默认分数
-    feedback = ""      # 默认反馈
     try:
-        # 解析 LLM 输出的 SCORE 和 FEEDBACK 字段
-        lines = content.split('\n')
-        for line in lines:
-            if line.startswith("SCORE:"):
-                score = float(line.split("SCORE:")[1].strip())
-            elif line.startswith("FEEDBACK:"):
-                feedback = line.split("FEEDBACK:")[1].strip()
-    except Exception:
-        # 解析失败时的兜底策略
-        # 这样做正确嘛？如果评估模型输出格式不符合预期，导致解析失败，我们暂时假设结果是合格的（score=0.8），并给出一个通用的改进建议。这样可以避免因为评估环节的异常而导致整个工作流崩溃，同时也能提供一些指导性的反馈信息。
-        score = 0.8
-        feedback = "解析异常，假设合格"
+        # 调用分析专用 LLM，使用 structured output 强类型约束
+        structured_llm = get_analysis_llm().with_structured_output(QualityEvaluation)
+        result = structured_llm.invoke([HumanMessage(content=eval_prompt)])
+        score = result.score
+        feedback = result.feedback
+    except Exception as e:
+        logger.error(f"结构化解析或大模型调用失败: {e}")
+        # 解析失败时的兜底策略 (安全悲观降级)
+        score = 0.0
+        feedback = "解析异常，需要重试"
         
     logger.info(f"   ✅ '{query[:20]}...' - 质量评估分数: {score:.2f} ({'达标' if score>=0.7 else '未达标'})")
 

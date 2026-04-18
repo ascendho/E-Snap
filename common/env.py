@@ -21,6 +21,11 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 CACHE_NAME = os.getenv("CACHE_NAME", "semantic-cache")
 CACHE_DISTANCE_THRESHOLD = float(os.getenv("CACHE_DISTANCE_THRESHOLD", "0.2"))
 
+ARK_BASE_URL = os.getenv("ARK_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3")
+ANALYSIS_MODEL_NAME = os.getenv("ANALYSIS_MODEL_NAME", "ep-m-20260411093114-9hftc")
+RESEARCH_MODEL_NAME = os.getenv("RESEARCH_MODEL_NAME", "deepseek-v3-2-251201")
+
+
 # ==========================================
 # 环境变量解析工具
 # ==========================================

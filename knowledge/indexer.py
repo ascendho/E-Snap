@@ -45,10 +45,7 @@ class KnowledgeBaseManager:
     def create_knowledge_base(
         self, 
         source_id: str, 
-        content, 
-        chunk_size: int = 2500, 
-        chunk_overlap: int = 250,
-        skip_chunking: bool = False
+        content
     ) -> Tuple[bool, str, Optional[SearchIndex]]:
         """
         核心方法：将输入内容（字符串或列表）转化为 Redis 中的向量搜索索引。
@@ -56,9 +53,6 @@ class KnowledgeBaseManager:
         Args:
             source_id: 唯一标识符，例如文档的 URL 或文件名。
             content: 待处理内容。支持字符串（需切分）或列表（已预处理好的块）。
-            chunk_size: 自动切片时，每个块的最大字符数。
-            chunk_overlap: 切片间的重叠字符数，用于保持上下文连贯性。
-            skip_chunking: 若为 True，则跳过内部切片逻辑（当外部已完成精细化切分时使用）。
             
         Returns:
             Tuple: (成功标志 bool, 结果描述消息 str, 索引对象 SearchIndex)
@@ -100,33 +94,8 @@ class KnowledgeBaseManager:
                 source_type = "structured_list" if has_structured_metadata else "text_list"
                 logger.info(f"使用提供的 {len(text_chunks)} 个文本块列表")
                 
-            elif isinstance(content, str):
-                # 处理长文本字符串输入
-                if skip_chunking:
-                    # 强制不切分：整个字符串视为一个向量存储
-                    text_chunks = [{"content": content, "metadata": {}}]
-                    source_type = "text_single"
-                    logger.info("将整个文本作为一个数据块")
-                else:
-                    # 使用 LangChain 的切分器按字符递归切分（优先按段落、句号切）
-                    splitter = RecursiveCharacterTextSplitter(
-                        chunk_size=chunk_size, 
-                        chunk_overlap=chunk_overlap
-                    )
-                    
-                    # 包装为 LangChain Document 格式以便切分
-                    docs = [Document(page_content=content, metadata={"source_id": source_id, "source": "text"})]
-                    doc_chunks = splitter.split_documents(docs)
-                    
-                    # 转换回标准化的字典格式
-                    text_chunks = [
-                        {"content": chunk.page_content, "metadata": chunk.metadata or {}}
-                        for chunk in doc_chunks
-                    ]
-                    source_type = "text_chunked"
-                    logger.info(f"将文本切分为 {len(text_chunks)} 个数据块")
             else:
-                return False, f"Unsupported content type: {type(content)}", None
+                return False, f"Unsupported content type: {type(content)}. Expected a list of chunks.", None
             
             # --- 步骤 2: 定义 Redis 向量索引 Schema（结构） ---
             # 该结构决定了数据如何在 Redis 中存储以及哪些字段可以被检索
@@ -220,9 +189,8 @@ class KnowledgeBaseManager:
 
 def create_knowledge_base_from_texts(
     texts: List[Union[str, Dict[str, Any]]],
-    source_id: str = "custom_texts",
-    redis_url: str = "redis://localhost:6379",
-    skip_chunking: bool = True
+    source_id: str,
+    redis_url: str
 ) -> Tuple[bool, str, Optional[SearchIndex]]:
     """
     顶层便捷函数：允许调用者通过简单的文本列表快速初始化 Redis 知识库。
@@ -231,12 +199,11 @@ def create_knowledge_base_from_texts(
         texts: 文本列表，可以是纯字符串，也可以是包含 content 和 metadata 的字典。
         source_id: 业务定义的唯一标识。
         redis_url: Redis 连接字符串。
-        skip_chunking: 默认 True，假定传入的 texts 已经是切好块的数据。
     """
     # 创建非解码模式的 Redis 客户端（向量二进制数据需要原始字节流）
     redis_client = redis.Redis.from_url(redis_url, decode_responses=False)
     kb_manager = KnowledgeBaseManager(redis_client)
-    return kb_manager.create_knowledge_base(source_id, texts, skip_chunking=skip_chunking)
+    return kb_manager.create_knowledge_base(source_id, texts)
 
 def _split_markdown_into_structured_chunks(markdown_text: str):
     """
