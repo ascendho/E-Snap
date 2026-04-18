@@ -1,5 +1,7 @@
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import warnings
 import os
@@ -122,3 +124,8 @@ async def chat_endpoint(request: ChatRequest, client_ip: str = "127.0.0.1"):
     except Exception as e:
         logger.error(f"Error processing query: {str(e)}")
         raise HTTPException(status_code=500, detail="An internal error occurred while processing your request.")
+
+# --- Mount Frontend Static Files ---
+# Important: This must be mounted AFTER API routes, otherwise it will intercept API calls.
+app.mount("/", StaticFiles(directory="frontend", html=True), name="frontend")
+

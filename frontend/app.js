@@ -13,8 +13,8 @@ document.addEventListener('DOMContentLoaded', () => {
     const quickActions = document.getElementById('quick-actions');
     const quickPills = document.querySelectorAll('.quick-pill');
 
-    // API Backend url - when deploying, switch to your remote url e.g. https://my-agent.zeabur.app/chat
-    const API_URL = 'http://127.0.0.1:8000/chat';
+    // Automatically adapt to current host domain for full-stack deployment
+    const API_URL = '/chat';
 
     // Theme Management
     if (localStorage.getItem('color-theme') === 'dark') {

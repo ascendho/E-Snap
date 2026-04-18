@@ -39,8 +39,12 @@ def to_bool_env(name: str, default: bool = False) -> bool:
 
 def set_ark_key():
     """
-    确保火山引擎（ARK）大模型的 API Key 可用；若缺失则触发交互式安全输入。
+    确保火山引擎（ARK）大模型的 API Key 可用；若缺失则触发交互式安全输入或报错。
     """
     if not os.getenv("ARK_API_KEY"):
-        os.environ["ARK_API_KEY"] = getpass.getpass("请输入你的 ARK API key: ")
+        import sys
+        if sys.stdin.isatty():
+            os.environ["ARK_API_KEY"] = getpass.getpass("请输入你的 ARK API key: ")
+        else:
+            raise ValueError("Critical Error: 线上环境缺少 'ARK_API_KEY' 或 'REDIS_URL' 环境变量配置！请在部署平台控制台添加。")
 
