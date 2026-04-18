@@ -21,7 +21,9 @@ class FAQDataContainer:
         # - question: 标准提问文本
         # - answer: 对应的官方答复
         # - (可选) id: 唯一标识符
-        self.faq_df = pd.read_csv("data/faq_seed.csv")
+        import os
+        faq_path = os.path.join(os.path.dirname(__file__), "..", "..", "data", "faq_seed.csv")
+        self.faq_df = pd.read_csv(faq_path)
         
         # 在控制台输出加载成功的反馈信息，便于开发者确认数据规模和路径是否正确
         print(f"✅ FAQ 种子数据加载成功：共计 {len(self.faq_df)} 条问答对")

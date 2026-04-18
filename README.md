@@ -57,14 +57,6 @@ CACHE_TTL_SECONDS=3600
 # 运行必需：火山引擎 ARK
 ARK_API_KEY=your_ark_api_key_here
 
-# 可选：如果你使用 Tavily 检索
-TAVILY_API_KEY=your_tavily_api_key_here
-
-# 可选：LangSmith 链路追踪
-LANGCHAIN_TRACING_V2=true
-LANGCHAIN_API_KEY=your_langsmith_key_here
-```
-
 注意：API Key 直接填纯文本，不要额外加引号。
 
 ### 5) 运行项目

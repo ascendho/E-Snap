@@ -4,7 +4,7 @@ from redisvl.utils.vectorize import HFTextVectorizer
 from knowledge.indexer import create_knowledge_base_from_texts, _split_markdown_into_structured_chunks
 from common.env import REDIS_URL # 统一从 env.py 中读取 Redis 链接
 
-RAW_DOCS_MD_PATH = Path(__file__).resolve().parents[1] / "data" / "raw_docs.md"
+RAW_DOCS_MD_PATH = Path(__file__).resolve().parents[2] / "data" / "raw_docs.md"
 
 def init_app_knowledge_base():
     """

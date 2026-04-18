@@ -65,6 +65,7 @@ class WorkflowState(TypedDict):
     cache_confidence: float             # 缓存匹配的相似度分数
     cache_seed_id: Optional[int]        # 缓存数据在数据库中的原始 ID
     cache_enabled: bool                 # 是否启用缓存开关
+    intercepted: bool                   # 是否已被前置拦截器拦截
     research_iterations: int            # 当前研究的迭代轮次
     max_research_iterations: int        # 允许的最大研究轮次
     research_quality_score: float       # 研究结果的质量得分
@@ -108,6 +109,40 @@ def initialize_nodes(sys_cache):
     """初始化节点，注入语义缓存实例"""
     global _cache_instance
     _cache_instance = sys_cache
+
+import re
+
+def pre_check_node(state: WorkflowState) -> WorkflowState:
+    """节点：前置拦截器（第零道防线）拦截时效性问题和特定商品型号查询"""
+    query = state["query"]
+    logger.info(f"🛡️ 执行前置拦截检查: '{query}'")
+    
+    # 1. 检查时效性问题（如“现在”、“目前”、“最新”、“库存”、“今天”）
+    time_sensitive_keywords = ["现在", "目前", "最新", "库存", "今天", "这几天"]
+    is_time_sensitive = any(kw in query for kw in time_sensitive_keywords)
+    
+    # 2. 检查特定商品型号（使用正则匹配，如 F2026-1-2，匹配 字母+数字-数字 结构）
+    # 例如：以一个或多个字母开头，跟着数字，然后带有横杠的型号
+    product_model_pattern = re.compile(r'[a-zA-Z]+\d+(?:-\d+)+')
+    mentions_product_model = bool(product_model_pattern.search(query))
+    
+    if is_time_sensitive or mentions_product_model:
+        logger.warning(f"   ⛔ 拦截触发: 时间敏感={is_time_sensitive}, 特定商品={mentions_product_model}")
+        canned_response = "抱歉，我们这个助手无法获取具体的实时库存或商品型号信息。"
+        return {
+            **state,
+            "answer": canned_response,
+            "final_response": canned_response,
+            "intercepted": True,
+            "execution_path": state.get("execution_path", []) + ["pre_check_intercepted"],
+        }
+    
+    logger.info("   ✅ 通过前置检查，放行")
+    return {
+        **state,
+        "intercepted": False,
+        "execution_path": state.get("execution_path", []) + ["pre_check_passed"],
+    }
 
 def check_cache_node(state: WorkflowState) -> WorkflowState:
     """节点：检查语义缓存（第一道防线）"""
@@ -297,8 +332,8 @@ def synthesize_response_node(state: WorkflowState) -> WorkflowState:
     final_response = f"针对您的问题：“{state['query']}”\n\n解答如下：\n{state['answer']}"
     
     # --- 【自学习逻辑】：将高质量研究结果回填至语义缓存 ---
-    # 只有当原本未命中缓存，且当前研究结果质量达标时，才执行存入 Redis 操作
-    if not state.get("cache_hit", False) and _cache_instance:
+    # 只有当原本未命中缓存（且非前置拦截），且当前研究结果质量达标时，才执行存入 Redis 操作
+    if not state.get("cache_hit", False) and not state.get("intercepted", False) and _cache_instance:
         if state.get("research_quality_score", 1.0) >= 0.7:
             logger.info(f"   💾 将高质量的回答写入语义缓存: '{state['query'][:20]}...'")
             # 下次如果有类似问题，就能直接从缓存拿，不再消耗大模型 token

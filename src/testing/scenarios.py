@@ -4,7 +4,7 @@ import os
 """测试场景模块。"""
 
 # 加载独立的测试数据文件
-_data_path = os.path.join(os.path.dirname(__file__), "..", "data", "test_scenarios.json")
+_data_path = os.path.join(os.path.dirname(__file__), "..", "..", "data", "test_scenarios.json")
 try:
     with open(_data_path, "r", encoding="utf-8") as f:
         _test_data = json.load(f)
@@ -24,3 +24,4 @@ _load_scenario("SCENARIO_1_QUERIES", "场景1")
 _load_scenario("SCENARIO_2_QUERIES", "场景2")
 _load_scenario("SCENARIO_3_QUERIES", "场景3")
 _load_scenario("SCENARIO_4_FUZZY_QUERIES", "场景4(模糊测试)")
+_load_scenario("SCENARIO_5_INTERCEPT_QUERIES", "场景5(拦截测试)")
