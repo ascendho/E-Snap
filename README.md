@@ -30,7 +30,7 @@
 
 ### 1. 环境准备
 - **Python 3.11+**
-- **Redis Server**（本地运行或在 `.env` 提供远程的 `REDIS_URL`）
+- **Redis Stack Server** (重要：由于本系统依赖 RedisVL 提供的向量和语义搜索能力，普通的 `redis` 无法运行。请必须安装 `redis-stack` 或带有 `search` 扩展的 Redis 服务器，例如 macOS 下使用 `brew install redis-stack` 后用 `redis-stack-server` 启动，或直接通过 Docker 运行 `redis/redis-stack:latest`)
 - **大模型 API Key**（如: 火山引擎/豆包模型 ARK_API_KEY，或其他接入渠道）
 
 ### 2. 安装依赖
