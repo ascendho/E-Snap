@@ -24,8 +24,14 @@ class CacheResults(BaseModel):
 def try_connect_to_redis(redis_url: str):
     try:
         r = redis.Redis.from_url(redis_url)
+        # --- 生产级安全对齐：容量与淘汰策略 ---
+        # 1. 限制 Redis 最大内存为100MB，防止恶意攻击或大规模缓存导致服务器 OOM (Out Of Memory)
+        r.config_set("maxmemory", "100mb")
+        # 2. 设置淘汰策略：当容量达到上限时，淘汰全库最近最少使用的 Key (allkeys-lru)
+        r.config_set("maxmemory-policy", "allkeys-lru")
+        
         r.ping()
-        print("✅ Redis 正在运行且可访问!")
+        print("✅ Redis 正在运行且可访问! (已配额: 100MB LRU 容量)")
         return r
     except redis.ConnectionError:
         print("❌ 无法连接到 Redis。请确保 Redis 在运行")

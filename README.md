@@ -58,6 +58,9 @@ uvicorn src.api.server:app --host 127.0.0.1 --port 8000 --reload
 ### 5. 开始体验
 打开浏览器访问 **[http://127.0.0.1:8000](http://127.0.0.1:8000)** 即可开始与您的智能客服智能体对话！
 
+### 6. 运行测试
+PYTHONPATH=. .venv/bin/python src/main.py
+
 ---
 
 ## 📚 知识库更新指南 (重要)
