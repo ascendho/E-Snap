@@ -1,28 +1,10 @@
 from typing import Dict, Any
 def run_agent(workflow_app, query: str) -> Dict[str, Any]:
-    from workflow.nodes import initialize_metrics
+    from workflow.nodes import build_initial_state
     import time
-    from datetime import datetime
     
     start_time = time.perf_counter()
-    initial_state = {
-        "query": query,
-        "answer": "",
-        "final_response": "",
-        "cache_hit": False,
-        "cache_confidence": 0.0,
-        "cache_seed_id": None,
-        "cache_enabled": True,
-        "research_iterations": 0,
-        "max_research_iterations": 3,
-        "research_quality_score": 0.0,
-        "research_feedback": "",
-        "current_research_strategy": "",
-        "execution_path": ["start"],
-        "metrics": initialize_metrics(),
-        "timestamp": datetime.now().isoformat(),
-        "llm_calls": {},
-    }
+    initial_state = build_initial_state(query)
     
     final_state = workflow_app.invoke(initial_state)
     total_time = (time.perf_counter() - start_time) * 1000
@@ -50,7 +32,6 @@ def display_results(result: Dict[str, Any]) -> None:
     print("📈 性能指标:")
     print(f"  • 词频总耗时: {metrics.get('total_latency', 0):.0f}ms")
     print(f"  • 节点执行路径: {' -> '.join(result.get('execution_path', []))}")
-    print(f"  • 研究轮次: {result.get('research_iterations', 0)}")
     
     print("-" * 60)
     print("🤖 最终回答:")
@@ -69,10 +50,11 @@ def analyze_agent_results(results: list) -> tuple:
         analysis_data = []
         for i, res in enumerate(results):
             metrics = res.get("metrics", {})
+            path = "拦截" if res.get("intercepted", False) else ("缓存复用" if res.get("cache_hit", False) else "研究")
             row = {
-                "cache_hit": "命中" if res.get("cache_hit", False) else "未命中",
+                "path_type": path,
                 "latency": metrics.get("total_latency", 0),
-                "research_iterations": res.get("research_iterations", 0),
+                "total_llm_calls": sum(res.get("llm_calls", {}).values()),
             }
             analysis_data.append(row)
 
@@ -84,8 +66,8 @@ def analyze_agent_results(results: list) -> tuple:
 缓存命中数: {total_cache_hits}
 缓存命中率: {(total_cache_hits/total_queries)*100 if total_queries > 0 else 0:.1f}%
 
-性能对比 (按命中状态分组的平均指标):
-{df.groupby('cache_hit')[['latency', 'research_iterations']].mean().round(2).to_string()}
+性能对比 (按路径分组的平均指标):
+{df.groupby('path_type')[['latency', 'total_llm_calls']].mean().round(2).to_string()}
 =========================================
 """
             logger.info(summary_text)

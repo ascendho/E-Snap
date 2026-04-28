@@ -64,9 +64,9 @@ def search_knowledge_base(query: str, top_k: int = 3) -> str:
     if not kb_index or not embeddings:
         return "错误：知识库组件（索引或模型）尚未初始化，请联系系统管理员。"
 
-    # 在日志中记录搜索请求，方便追踪 Agent 的行为逻辑
+    # 在日志中记录搜索请求。这里的 query 是 LLM 为工具调用生成/转发的检索词，不一定等于用户原句。
     logger.info(
-        f"🔍 触发知识库检索工具 | 查询词: '{query}' | 检索数量: {top_k}"
+        f"🔍 触发知识库检索工具 | 工具检索词: '{query}' | 返回条数: {top_k}"
     )
 
     try:

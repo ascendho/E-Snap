@@ -8,6 +8,7 @@ import os
 import sys
 from common.env import set_ark_key
 from workflow.graph import create_agent_graph
+from workflow.nodes import build_initial_state
 from knowledge.builder import init_app_knowledge_base
 from cache.auto_heater import setup_cache
 from common.logger import setup_logging
@@ -166,10 +167,7 @@ async def chat_endpoint(request: ChatRequest, client_ip: str = "127.0.0.1"):
     start_time = time.time()
     
     try:
-        initial_state = {
-            "query": request.query,
-            "research_iterations": 0
-        }
+        initial_state = build_initial_state(request.query)
         
         # Invoke the workflow graph
         final_state = workflow_app.invoke(initial_state)

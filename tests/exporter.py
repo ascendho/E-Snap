@@ -12,6 +12,32 @@ def export_results(all_results: List[Dict], total_wall_time_sec: float, output_d
     summary_csv = os.path.join(output_dir, "run_summary.csv")
     perf_metrics_txt = os.path.join(output_dir, "performance_report.txt")
 
+    def execution_path(result: Dict) -> List[str]:
+        return result.get("execution_path", []) or []
+
+    def total_llm_calls(result: Dict) -> int:
+        return sum(result.get("llm_calls", {}).values())
+
+    def avg_latency(subset: List[Dict]) -> float:
+        if not subset:
+            return 0.0
+        return sum(r.get("metrics", {}).get("total_latency", 0) for r in subset) / len(subset)
+
+    def avg_metric(subset: List[Dict], metric_name: str) -> float:
+        if not subset:
+            return 0.0
+        return sum(r.get("metrics", {}).get(metric_name, 0) for r in subset) / len(subset)
+
+    def avg_state_value(subset: List[Dict], field_name: str) -> float:
+        if not subset:
+            return 0.0
+        return sum(float(r.get(field_name, 0) or 0) for r in subset) / len(subset)
+
+    def avg_llm_calls(subset: List[Dict]) -> float:
+        if not subset:
+            return 0.0
+        return sum(total_llm_calls(r) for r in subset) / len(subset)
+
     # 1. 场景级汇总：每条主查询一行。
     with open(summary_csv, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(
@@ -19,12 +45,20 @@ def export_results(all_results: List[Dict], total_wall_time_sec: float, output_d
             fieldnames=[
                 "scenario_index",
                 "original_query",
+                "intercepted",
                 "cache_hit",
+                "cache_candidate_found",
                 "cache_matched_question",
                 "cache_confidence",
-                "research_iterations",
+                "cache_rerank_passed",
+                "cache_rerank_score",
+                "cache_rerank_reason",
                 "analysis_llm_calls",
                 "research_llm_calls",
+                "total_llm_calls",
+                "cache_latency_ms",
+                "rerank_latency_ms",
+                "research_latency_ms",
                 "total_latency_ms",
                 "final_response",
             ],
@@ -32,9 +66,10 @@ def export_results(all_results: List[Dict], total_wall_time_sec: float, output_d
         writer.writeheader()
 
         for idx, result in enumerate(all_results, 1):
+            intercepted = result.get("intercepted", False)
             cache_hit = result.get("cache_hit", False)
+            cache_candidate_found = bool(result.get("cache_matched_question"))
             cache_confidence = result.get("cache_confidence", 0.0)
-            research_iterations = result.get("research_iterations", 0)
 
             llm_calls = result.get("llm_calls", {})
             metrics = result.get("metrics", {})
@@ -44,12 +79,20 @@ def export_results(all_results: List[Dict], total_wall_time_sec: float, output_d
                 {
                     "scenario_index": idx,
                     "original_query": result.get("query", ""),
+                    "intercepted": str(intercepted),
                     "cache_hit": str(cache_hit),
+                    "cache_candidate_found": str(cache_candidate_found),
                     "cache_matched_question": result.get("cache_matched_question", ""),
                     "cache_confidence": f"{cache_confidence:.4f}",
-                    "research_iterations": research_iterations,
+                    "cache_rerank_passed": str(result.get("cache_rerank_passed", False)),
+                    "cache_rerank_score": f"{result.get('cache_rerank_score', 0.0):.4f}",
+                    "cache_rerank_reason": result.get("cache_rerank_reason", ""),
                     "analysis_llm_calls": llm_calls.get("analysis_llm", 0),
                     "research_llm_calls": llm_calls.get("research_llm", 0),
+                    "total_llm_calls": total_llm_calls(result),
+                    "cache_latency_ms": f"{metrics.get('cache_latency', 0):.0f}",
+                    "rerank_latency_ms": f"{metrics.get('rerank_latency', 0):.0f}",
+                    "research_latency_ms": f"{metrics.get('research_latency', 0):.0f}",
                     "total_latency_ms": total_latency,
                     "final_response": result.get("final_response", ""),
                 }
@@ -57,48 +100,45 @@ def export_results(all_results: List[Dict], total_wall_time_sec: float, output_d
 
     # 2. 计算并聚合性能级指标报表
     total_queries = len(all_results)
-    cache_hits = [r for r in all_results if r.get("cache_hit", False)]
-    cache_misses = [r for r in all_results if not r.get("cache_hit", False)]
-    
-    num_hits = len(cache_hits)
-    hit_rate = num_hits / total_queries if total_queries > 0 else 0.0
+    intercepted_paths = [r for r in all_results if r.get("intercepted", False)]
+    eligible_queries = [r for r in all_results if not r.get("intercepted", False)]
+    cache_reuse_paths = [r for r in eligible_queries if r.get("cache_hit", False)]
+    research_paths = [r for r in eligible_queries if "researched" in execution_path(r)]
+    cache_candidates = [r for r in eligible_queries if r.get("cache_matched_question")]
+    rerank_passed = [r for r in cache_candidates if r.get("cache_rerank_passed", False)]
+
+    eligible_count = len(eligible_queries)
+    num_hits = len(cache_reuse_paths)
+    candidate_count = len(cache_candidates)
+    intercept_count = len(intercepted_paths)
+    final_cache_reuse_rate = num_hits / eligible_count if eligible_count > 0 else 0.0
+    candidate_hit_rate = candidate_count / eligible_count if eligible_count > 0 else 0.0
+    rerank_pass_rate = len(rerank_passed) / candidate_count if candidate_count > 0 else 0.0
     throughput = total_queries / total_wall_time_sec if total_wall_time_sec > 0 else 0.0
-    
-    def avg_latency(subset):
-        if not subset: return 0.0
-        return sum(r.get("metrics", {}).get("total_latency", 0) for r in subset) / len(subset)
-    
-    def avg_llm_calls(subset):
-        if not subset: return 0.0
-        return sum(sum(r.get("llm_calls", {}).values()) for r in subset) / len(subset)
-    
-    miss_latency = avg_latency(cache_misses)
-    hit_latency = avg_latency(cache_hits)
-    
-    miss_cost = avg_llm_calls(cache_misses)
-    # hit_cost = avg_llm_calls(cache_hits)  # Usually 0 for cache hits
-    
-    # WCL Calculations (基于图1 WCL公式)
-    acl = hit_latency
-    all_time = miss_latency - hit_latency if miss_latency > hit_latency else 0.0
-    chr_rate = hit_rate
-    wcl = acl * chr_rate + (all_time + acl) * (1 - chr_rate)
-    
-    # Total Latency Reduction (基于整体执行耗时)
-    theory_total_time_without_cache = miss_latency * total_queries
+
+    research_latency = avg_latency(research_paths)
+    cache_reuse_latency = avg_latency(cache_reuse_paths)
+    intercepted_latency = avg_latency(intercepted_paths)
+    avg_cache_check_latency = avg_metric(eligible_queries, "cache_latency")
+    avg_rerank_latency = avg_metric(cache_candidates, "rerank_latency")
+    avg_research_stage_latency = avg_metric(research_paths, "research_latency")
+
+    research_cost = avg_llm_calls(research_paths)
+    cache_reuse_cost = avg_llm_calls(cache_reuse_paths)
+    llm_savings_per_request = max(research_cost - cache_reuse_cost, 0.0) * final_cache_reuse_rate
+
+    intercepted_total_time = sum(r.get("metrics", {}).get("total_latency", 0) for r in intercepted_paths)
+    theory_total_time_without_cache = research_latency * eligible_count + intercepted_total_time
     actual_total_time = sum(r.get("metrics", {}).get("total_latency", 0) for r in all_results)
-    
+
     if theory_total_time_without_cache > 0:
         latency_reduction = ((theory_total_time_without_cache - actual_total_time) / theory_total_time_without_cache) * 100
     else:
         latency_reduction = 0.0
-    
-    # 成本节省 (Cost Savings) 
-    cost_savings_calls = hit_rate * miss_cost
-    
+
     # 吞吐量指标
-    baseline_qps = 1000.0 / miss_latency if miss_latency > 0 else 0.0
-    max_qps = 1000.0 / hit_latency if hit_latency > 0 else 0.0
+    baseline_qps = total_queries / (theory_total_time_without_cache / 1000.0) if theory_total_time_without_cache > 0 else 0.0
+    max_qps = 1000.0 / cache_reuse_latency if cache_reuse_latency > 0 else 0.0
 
     report_text = f"""======================================================
          AGENT CACHE PERFORMANCE REPORT
@@ -107,41 +147,51 @@ def export_results(all_results: List[Dict], total_wall_time_sec: float, output_d
 1. 总体概况 (Overview)
 ------------------------------------------------------
 测试集总请求数 : {total_queries} 次
-缓存命中数     : {num_hits} 次
-缓存命中率     : {hit_rate * 100:.2f}%
+前置拦截数     : {intercept_count} 次
+可参与缓存查询数 : {eligible_count} 次
+缓存候选数     : {candidate_count} 次
+最终缓存复用数 : {num_hits} 次
+缓存候选率     : {candidate_hit_rate * 100:.2f}%
+最终缓存复用率 : {final_cache_reuse_rate * 100:.2f}%
 测试总墙上时间 : {total_wall_time_sec:.2f} 秒
 
-2. 工作负载延迟分析 (WCL - Workload Cache Latency)
+2. 路径延迟拆分 (Path Latency Breakdown)
 ------------------------------------------------------
-WCL = ACL * CHR + (ALL + ACL) * (1 - CHR)
+- 平均缓存检查耗时           : {avg_cache_check_latency:.0f} ms
+- 平均 Reranker 耗时         : {avg_rerank_latency:.0f} ms
+- 平均 Research 阶段耗时     : {avg_research_stage_latency:.0f} ms
+- 缓存复用路径平均总耗时     : {cache_reuse_latency:.0f} ms
+- RAG 路径平均总耗时         : {research_latency:.0f} ms
+- 前置拦截路径平均总耗时     : {intercepted_latency:.0f} ms
 
-- ACL (Average Cache Latency) = {acl:.0f} ms
-- ALL (Average LLM Latency)   = {all_time:.0f} ms
-- CHR (Cache Hit Ratio)       = {chr_rate * 100:.2f}%
-
-=> WCL = {wcl:.0f} ms
-
-3. 吞吐量对比 (Throughput / QPS)
+3. Reranker 效果
 ------------------------------------------------------
-无缓存基线 QPS (0%命中)       : {baseline_qps:.2f} 请求/秒
+Reranker 通过数              : {len(rerank_passed)} 次
+Reranker 通过率              : {rerank_pass_rate * 100:.2f}%
+平均 Reranker 置信度         : {avg_state_value(cache_candidates, 'cache_rerank_score'):.2f}
+
+4. 吞吐量对比 (Throughput / QPS)
+------------------------------------------------------
+无缓存复用基线 QPS           : {baseline_qps:.2f} 请求/秒
 加入缓存后实测 QPS            : {throughput:.2f} 请求/秒
-全量缓存理论峰值 QPS(100%命中): {max_qps:.2f} 请求/秒
+缓存复用路径理论峰值 QPS      : {max_qps:.2f} 请求/秒
 吞吐量提升倍数                : {throughput / baseline_qps if baseline_qps > 0 else 0:.2f} 倍
 
-4. 延迟总降低 (Total Latency Reduction)
+5. 延迟总降低 (Total Latency Reduction)
 ------------------------------------------------------
-理论上无缓存总耗时            : {theory_total_time_without_cache:.0f} ms
+理论上无缓存复用总耗时        : {theory_total_time_without_cache:.0f} ms
 实际执行总耗时                : {actual_total_time:.0f} ms
 📌 Latency Reduction         : {latency_reduction:.2f}% 
 
-(公式: (理论无缓存总耗时 - 实际执行总耗时) / 理论无缓存总耗时)
+(说明: baseline 保留前置拦截路径，仅将可参与缓存的请求替换为 RAG 路径平均耗时)
 
-5. 成本节省 (Cost Savings)
+6. 成本节省 (Cost Savings)
 ------------------------------------------------------
-大模型平均单次调用数 (LLM_cost): {miss_cost:.2f} 次
-📌 Cost Savings (节省调用频次) : {cost_savings_calls:.2f} 次 / 请求
+RAG 路径平均 LLM 调用数       : {research_cost:.2f} 次
+缓存复用路径平均 LLM 调用数   : {cache_reuse_cost:.2f} 次
+📌 Cost Savings (节省调用频次) : {llm_savings_per_request:.2f} 次 / 请求
 
-(公式: Hit_rate x LLM_cost_per_query)
+(公式: Final_Cache_Reuse_Rate x max(RAG_cost - CacheReuse_cost, 0))
 ======================================================
 """
     with open(perf_metrics_txt, "w", encoding="utf-8") as f:

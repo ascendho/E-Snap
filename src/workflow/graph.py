@@ -7,12 +7,12 @@ from workflow.nodes import (
     initialize_nodes,         # 初始化节点所需的依赖
     pre_check_node,           # 节点0：前置拦截器
     check_cache_node,         # 节点1：检查语义缓存
+    rerank_cache_node,        # 节点1.5：LLM Reranker，判定缓存答案能否复用
     research_node,            # 节点2：执行搜索/研究
-    evaluate_quality_node,    # 节点3：评估研究结果质量
-    synthesize_response_node, # 节点4：整合资料并生成回答
+    synthesize_response_node, # 节点3：整合资料并生成回答
 )
 # 导入边缘路由函数：决定流程走向的逻辑（Decision）
-from workflow.edges import cache_router, research_quality_router
+from workflow.edges import cache_router, cache_rerank_router
 # 导入工具初始化函数：主要用于初始化向量数据库检索工具
 from workflow.tools import initialize_tools
 
@@ -22,9 +22,9 @@ def create_agent_graph(sys_cache=None, kb_index=None, embeddings=None) -> StateG
     
     该图定义了智能体如何处理问题：
     1. 先查缓存 
-    2. 没命中则研究 
-    3. 研究完评估质量 
-    4. 质量不行重搜，质量行了就出报告。
+    2. 命中候选则做缓存复用裁判
+    3. 未命中或裁判拒绝则研究
+    4. 研究完成后直接出报告。
     """
     
     # --- 基础组件初始化 ---
@@ -41,8 +41,8 @@ def create_agent_graph(sys_cache=None, kb_index=None, embeddings=None) -> StateG
     # 1. 添加节点 (Nodes)
     workflow.add_node("pre_check", pre_check_node)               # 前置拦截器节点
     workflow.add_node("check_cache", check_cache_node)           # 缓存检查节点
+    workflow.add_node("rerank_cache", rerank_cache_node)         # 缓存复用裁判节点（LLM Reranker）
     workflow.add_node("research", research_node)                 # 知识检索/研究节点
-    workflow.add_node("evaluate_quality", evaluate_quality_node) # 质量打分节点
     workflow.add_node("synthesize_response", synthesize_response_node) # 最终响应合成节点
 
     # 2. 设置入口点 (Entry Point)
@@ -58,10 +58,20 @@ def create_agent_graph(sys_cache=None, kb_index=None, embeddings=None) -> StateG
         }
     )
 
-    # 3. 配置条件边缘 (Conditional Edges)
+    # check_cache 之后：有候选则进入 Reranker，否则直接走 RAG
     workflow.add_conditional_edges(
         "check_cache",
-        cache_router, # 路由逻辑：命中则去 synthesize_response，未命中则去 research
+        cache_router,
+        {
+            "rerank_cache": "rerank_cache",
+            "research": "research"
+        }
+    )
+
+    # rerank_cache 之后：通过则合成回答，未通过则走 RAG
+    workflow.add_conditional_edges(
+        "rerank_cache",
+        cache_rerank_router,
         {
             "synthesize_response": "synthesize_response",
             "research": "research"
@@ -69,27 +79,16 @@ def create_agent_graph(sys_cache=None, kb_index=None, embeddings=None) -> StateG
     )
 
     # 4. 配置普通边缘 (Normal Edges)
-    # research 运行完后，无条件进入 evaluate_quality 进行打分
-    workflow.add_edge("research", "evaluate_quality")
+    # research 运行完后，直接进入 synthesize_response 生成最终回答
+    workflow.add_edge("research", "synthesize_response")
 
-    # 5. 配置带反馈循环的条件边缘 (Feedback Loop)
-    # evaluate_quality 运行完后，由 research_quality_router 决定
-    workflow.add_conditional_edges(
-        "evaluate_quality",
-        research_quality_router, # 路由逻辑：质量达标去合成，不达标则退回 research 重新搜
-        {
-            "synthesize_response": "synthesize_response",
-            "research": "research"
-        }
-    )
-
-    # 6. 设置终点
+    # 5. 设置终点
     # synthesize_response 运行完后，流程结束
     workflow.add_edge("synthesize_response", END)
 
     # --- 日志记录与编译 ---
     logger = logging.getLogger("agentic-workflow")
-    logger.info("LangGraph 计算图构建完成，逻辑包含：语义缓存 -> RAG循环 -> 动态路由")
+    logger.info("LangGraph 计算图构建完成，逻辑包含：语义缓存 -> Reranker -> 单轮RAG -> 动态路由")
 
     # 编译计算图，返回一个可执行的 app 对象
     return workflow.compile()
