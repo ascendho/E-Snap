@@ -20,6 +20,7 @@ def display_results(result: Dict[str, Any]) -> None:
     cache_conf = result.get("cache_confidence", 0.0)
     cache_match_type = result.get("cache_match_type", "none")
     cache_reuse_mode = result.get("cache_reuse_mode", "none")
+    cache_written_prompts = result.get("cache_written_prompts", []) or []
 
     print("\n" + "=" * 60)
     print(f"🧐 查询: {query}")
@@ -36,6 +37,8 @@ def display_results(result: Dict[str, Any]) -> None:
     print("📈 性能指标:")
     print(f"  • 词频总耗时: {metrics.get('total_latency', 0):.0f}ms")
     print(f"  • 节点执行路径: {' -> '.join(result.get('execution_path', []))}")
+    if cache_written_prompts:
+        print(f"  • 本轮写回缓存: {' | '.join(cache_written_prompts)}")
     
     print("-" * 60)
     print("🤖 最终回答:")
@@ -49,6 +52,8 @@ def classify_result_path(result: Dict[str, Any]) -> str:
         return "精确缓存直出"
     if result.get("cache_hit", False) and result.get("cache_match_type") == "near_exact":
         return "近精确缓存直出"
+    if result.get("cache_hit", False) and result.get("cache_match_type") == "edit_distance":
+        return "编辑距离缓存直出"
     if result.get("cache_reuse_mode") == "full_reuse":
         return "Reranker完整复用"
     if result.get("cache_reuse_mode") == "partial_reuse":
@@ -59,7 +64,8 @@ def classify_result_path(result: Dict[str, Any]) -> str:
 
 def analyze_agent_results(results: list) -> tuple:
     total_queries = len(results)
-    total_cache_hits = sum(1 for r in results if r.get("cache_hit", False))
+    direct_cache_hits = sum(1 for r in results if r.get("cache_hit", False))
+    partial_reuse_count = sum(1 for r in results if r.get("cache_reuse_mode") == "partial_reuse")
 
     logger.info(f"📊 分析 {total_queries} 个查询的性能数据...")
 
@@ -81,8 +87,9 @@ def analyze_agent_results(results: list) -> tuple:
             summary_text = f"""
 ================ 分析摘要 ================
 总查询数: {total_queries}
-缓存命中数: {total_cache_hits}
-缓存命中率: {(total_cache_hits/total_queries)*100 if total_queries > 0 else 0:.1f}%
+直接缓存命中数(cache_hit=True): {direct_cache_hits}
+partial_reuse 数: {partial_reuse_count}
+直接缓存命中率: {(direct_cache_hits/total_queries)*100 if total_queries > 0 else 0:.1f}%
 
 性能对比 (按路径分组的平均指标):
 {df.groupby('path_type')[['latency', 'total_llm_calls']].mean().round(2).to_string()}
@@ -92,7 +99,7 @@ def analyze_agent_results(results: list) -> tuple:
     except Exception as e:
         logger.error(f"分析摘要生成失败: {str(e)}")
 
-    return total_queries, total_cache_hits
+    return total_queries, direct_cache_hits
 
 
 from typing import Any, Dict
@@ -131,8 +138,9 @@ def run_workflow_scenarios(
 
     logger.info("分析 Agent 性能...")
     total_questions, total_cache_hits = analyze_agent_results(all_results)
-    logger.info("子问题总数: %s, 缓存命中总数: %s, 吞吐量 QPS: %.2f，总耗时 %.2fs", 
-                total_questions, total_cache_hits, len(all_results)/total_wall_time, total_wall_time)
+    partial_reuse_count = sum(1 for r in all_results if r.get("cache_reuse_mode") == "partial_reuse")
+    logger.info("子问题总数: %s, 直接缓存命中数: %s, partial_reuse 数: %s, 吞吐量 QPS: %.2f，总耗时 %.2fs", 
+                total_questions, total_cache_hits, partial_reuse_count, len(all_results)/total_wall_time, total_wall_time)
 
     return {
         "results": all_results,

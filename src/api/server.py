@@ -115,6 +115,7 @@ class ChatResponse(BaseModel):
     cache_reuse_mode: str
     label_key: str
     label_text: str
+    cache_written_prompts: list[str]
 
 class ValidateRequest(BaseModel):
     access_code: str
@@ -184,6 +185,9 @@ def build_label_metadata(final_state: dict) -> dict:
     elif cache_hit and cache_match_type == "near_exact":
         label_key = "cache_near_exact"
         label_text = "Near-Exact Cache Hit"
+    elif cache_hit and cache_match_type == "edit_distance":
+        label_key = "cache_edit_distance"
+        label_text = "Edit-Distance Cache Hit"
     elif cache_reuse_mode == "full_reuse":
         label_key = "cache_semantic_reuse"
         label_text = "Reranked Cache Reuse"
@@ -206,12 +210,14 @@ def build_label_metadata(final_state: dict) -> dict:
 def build_chat_response(final_state: dict, latency_ms: float) -> ChatResponse:
     answer = final_state.get("final_response", "系统遇到了未知错误，请稍后重试。")
     metadata = build_label_metadata(final_state)
+    metadata["cache_written_prompts"] = final_state.get("cache_written_prompts", []) or []
     return ChatResponse(answer=answer, latency_ms=latency_ms, **metadata)
 
 def build_stream_final_event(final_state: dict, latency_ms: float, answer: str) -> dict:
     return {
         "answer": answer,
         "latency_ms": latency_ms,
+        "cache_written_prompts": final_state.get("cache_written_prompts", []) or [],
         **build_label_metadata(final_state),
     }
 

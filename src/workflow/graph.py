@@ -66,6 +66,7 @@ def create_agent_graph(sys_cache=None, kb_index=None, embeddings=None) -> StateG
         cache_router,
         {
             "synthesize_response": "synthesize_response",
+            "research_supplement": "research_supplement",
             "rerank_cache": "rerank_cache",
             "research": "research"
         }

@@ -1,7 +1,9 @@
 import json
 import logging  # 导入日志模块，记录程序运行状态
 import os       # 导入操作系统接口，用于读取环境变量
+import threading
 import time     # 导入时间模块，用于性能耗时统计
+import unicodedata
 from datetime import datetime  # 导入日期时间模块
 from typing import Any, Dict, List, Literal, Optional, Tuple, TypedDict  # 导入类型提示，增强代码可读性和健壮性
 
@@ -26,7 +28,7 @@ logger = logging.getLogger("agentic-workflow")
 _analysis_llm = None
 _research_llm = None
 
-CacheMatchType = Literal["exact", "near_exact", "subquery_exact", "subquery_near_exact", "semantic", "none"]
+CacheMatchType = Literal["exact", "near_exact", "edit_distance", "subquery_exact", "subquery_near_exact", "semantic", "none"]
 CacheReuseMode = Literal["full_reuse", "partial_reuse", "reject", "none"]
 RerankAttempt = Literal["none", "skipped", "primary", "fallback", "failed"]
 
@@ -88,8 +90,13 @@ class WorkflowState(TypedDict):
     cache_reuse_mode: CacheReuseMode    # full_reuse/partial_reuse/reject/none
     cache_rerank_attempt: RerankAttempt # rerank 实际采用的判定路径
     cache_rerank_score: float           # Reranker 给出的复用置信度
-    cache_rerank_reason: str            # Reranker 给出的判定理由
+    cache_rerank_reason: str            # 最终采用的判定/拒绝理由
+    cache_reranker_reason: str          # Reranker 原始输出理由
+    cache_validation_reason: str        # 后置校验阶段给出的拒绝理由
+    cache_reranker_residual_query: str  # Reranker 原始输出的 residual_query
     cache_residual_query: str           # partial_reuse 时尚未覆盖的缺口查询
+    cache_writeback_entries: List[Dict[str, str]]  # 除主 query 外额外需要写入缓存的问答对
+    cache_written_prompts: List[str]    # 本轮实际写入缓存的 query / alias 列表
     current_research_strategy: str      # 当前采取的检索策略描述
     execution_path: List[str]           # 记录工作流经过的节点路径
     metrics: WorkflowMetrics            # 性能监控数据
@@ -130,7 +137,12 @@ def build_initial_state(query: str) -> WorkflowState:
         "cache_rerank_attempt": "none",
         "cache_rerank_score": 0.0,
         "cache_rerank_reason": "",
+        "cache_reranker_reason": "",
+        "cache_validation_reason": "",
+        "cache_reranker_residual_query": "",
         "cache_residual_query": "",
+        "cache_writeback_entries": [],
+        "cache_written_prompts": [],
         "current_research_strategy": "",
         "execution_path": ["start"],
         "metrics": initialize_metrics(),
@@ -162,6 +174,9 @@ RERANK_FALLBACK_ANSWER_CHAR_LIMIT = 180
 PARTIAL_REUSE_MIN_SCORE = 0.97
 PARTIAL_REUSE_MAX_RESIDUAL_CHARS = 18
 PARTIAL_REUSE_MAX_RESIDUAL_RATIO = 0.28
+PARTIAL_REUSE_SHORT_RESIDUAL_MIN_SCORE = 0.90
+PARTIAL_REUSE_SHORT_RESIDUAL_MAX_CHARS = 5
+PARTIAL_REUSE_SHORT_RESIDUAL_MAX_RATIO = 0.30
 PARTIAL_REUSE_MAX_CACHED_ANSWER_CHARS = 320
 RERANK_FALLBACK_PROMPT = """请仅输出一行 JSON，不要加解释。\n"
 RERANK_FALLBACK_PROMPT += '{"reuse_mode":"full_reuse|partial_reuse|reject","score":0.0,"reason":"不超过20字","residual_query":"partial_reuse 时填写，否则留空"}\n'
@@ -235,6 +250,14 @@ def check_cache_node(state: WorkflowState) -> WorkflowState:
         cache_match_type = "none"
         cache_base_answer = ""
         answer = ""
+        cache_reuse_mode = state.get("cache_reuse_mode", "none")
+        cache_rerank_attempt = state.get("cache_rerank_attempt", "none")
+        cache_rerank_score = state.get("cache_rerank_score", 0.0)
+        cache_rerank_reason = state.get("cache_rerank_reason", "")
+        cache_reranker_reason = state.get("cache_reranker_reason", "")
+        cache_validation_reason = state.get("cache_validation_reason", "")
+        cache_reranker_residual_query = state.get("cache_reranker_residual_query", "")
+        cache_residual_query = state.get("cache_residual_query", "")
     else:
         # 在 Redis 中执行语义检索，设定阈值从 env 读取
         from common.env import CACHE_DISTANCE_THRESHOLD
@@ -248,7 +271,35 @@ def check_cache_node(state: WorkflowState) -> WorkflowState:
             cache_match_type = best_match.match_type
             cache_base_answer = best_match.response
             answer = best_match.response
-            logger.info(f"   ✅ 缓存命中[{cache_match_type}] ({cache_confidence:.3f}): '{query}' -> 匹配到了 '{cache_matched_question}'")
+            cache_reuse_mode = "none"
+            cache_rerank_attempt = "none"
+            cache_rerank_score = 0.0
+            cache_rerank_reason = ""
+            cache_reranker_reason = ""
+            cache_validation_reason = ""
+            cache_reranker_residual_query = ""
+            cache_residual_query = ""
+
+            if str(cache_match_type).startswith("subquery_"):
+                deterministic_residual = _derive_deterministic_subquery_residual(query, cache_matched_question)
+                if deterministic_residual:
+                    cache_hit = False
+                    answer = ""
+                    cache_reuse_mode = "partial_reuse"
+                    cache_rerank_attempt = "skipped"
+                    cache_rerank_reason = "deterministic_subquery_fastpath"
+                    cache_reranker_reason = "deterministic_subquery_fastpath"
+                    cache_reranker_residual_query = deterministic_residual
+                    cache_residual_query = deterministic_residual
+                    logger.info(
+                        "   🧩 规则子问题命中，跳过 Reranker 直接补充研究: '%s' | 缺口: '%s'",
+                        query,
+                        deterministic_residual,
+                    )
+                else:
+                    logger.info(f"   ✅ 缓存命中[{cache_match_type}] ({cache_confidence:.3f}): '{query}' -> 匹配到了 '{cache_matched_question}'")
+            else:
+                logger.info(f"   ✅ 缓存命中[{cache_match_type}] ({cache_confidence:.3f}): '{query}' -> 匹配到了 '{cache_matched_question}'")
         else:  # 未命中
             cache_hit = False
             cache_matched_question = None
@@ -257,6 +308,14 @@ def check_cache_node(state: WorkflowState) -> WorkflowState:
             cache_match_type = "none"
             cache_base_answer = ""
             answer = ""
+            cache_reuse_mode = "none"
+            cache_rerank_attempt = "none"
+            cache_rerank_score = 0.0
+            cache_rerank_reason = ""
+            cache_reranker_reason = ""
+            cache_validation_reason = ""
+            cache_reranker_residual_query = ""
+            cache_residual_query = ""
             logger.info(f"   ❌ 缓存未命中: '{query}'")
 
     # 计算该节点耗时（毫秒）
@@ -281,6 +340,14 @@ def check_cache_node(state: WorkflowState) -> WorkflowState:
         "cache_seed_id": cache_seed_id,
         "cache_match_type": cache_match_type,
         "cache_base_answer": cache_base_answer,
+        "cache_reuse_mode": cache_reuse_mode,
+        "cache_rerank_attempt": cache_rerank_attempt,
+        "cache_rerank_score": cache_rerank_score,
+        "cache_rerank_reason": cache_rerank_reason,
+        "cache_reranker_reason": cache_reranker_reason,
+        "cache_validation_reason": cache_validation_reason,
+        "cache_reranker_residual_query": cache_reranker_residual_query,
+        "cache_residual_query": cache_residual_query,
         "execution_path": state["execution_path"] + ["cache_checked"], # 更新执行路径轨迹
         "metrics": metrics,
     }
@@ -319,16 +386,58 @@ def _build_rerank_attempts(query: str, cached_question: str, cached_answer: str)
     ]
 
 def _extract_json_object(raw_text: str) -> str:
-    match = re.search(r"\{.*\}", raw_text, re.S)
-    if not match:
-        raise ValueError("未找到 JSON 对象")
-    return match.group(0)
+    cleaned_text = str(raw_text or "").strip()
+    if cleaned_text.startswith("```"):
+        cleaned_text = re.sub(r"^```(?:json)?\s*", "", cleaned_text, flags=re.I)
+        cleaned_text = re.sub(r"\s*```$", "", cleaned_text)
+
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\{", cleaned_text):
+        try:
+            payload, _ = decoder.raw_decode(cleaned_text[match.start():])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return json.dumps(payload, ensure_ascii=False)
+
+    raise ValueError("未找到可解析 JSON 对象")
+
+def _build_safe_reranker_reject(reason: str) -> RerankerEvaluation:
+    fallback_reason = (reason or "fallback_parse_error").strip()[:64]
+    return RerankerEvaluation(
+        reuse_mode="reject",
+        score=0.0,
+        reason=fallback_reason,
+        residual_query="",
+    )
 
 def _parse_reranker_fallback_response(raw_text: str) -> RerankerEvaluation:
-    payload = json.loads(_extract_json_object(raw_text))
+    try:
+        payload = json.loads(_extract_json_object(raw_text))
+    except Exception as exc:
+        logger.warning(
+            "   ⚠️ Reranker fallback 解析失败，安全降级为 reject | error=%s | raw=%s",
+            exc,
+            _clip_rerank_answer(str(raw_text), max_chars=160),
+        )
+        return _build_safe_reranker_reject("fallback_parse_error")
+
+    if not isinstance(payload, dict):
+        logger.warning("   ⚠️ Reranker fallback 返回了非对象 JSON，安全降级为 reject | payload=%s", payload)
+        return _build_safe_reranker_reject("fallback_json_not_object")
+
+    if "reuse_mode" not in payload:
+        logger.warning("   ⚠️ Reranker fallback 缺少 reuse_mode，安全降级为 reject | payload=%s", payload)
+        return _build_safe_reranker_reject("fallback_missing_reuse_mode")
+
+    try:
+        score = float(payload.get("score", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        score = 0.0
+
     return RerankerEvaluation(
         reuse_mode=_normalize_reuse_mode(str(payload.get("reuse_mode", "reject"))),
-        score=float(payload.get("score", 0.0) or 0.0),
+        score=score,
         reason=str(payload.get("reason", "") or ""),
         residual_query=str(payload.get("residual_query", "") or ""),
     )
@@ -363,18 +472,26 @@ def _invoke_reranker(query: str, cached_question: str, cached_answer: str) -> Tu
             len(fallback["cached_answer_excerpt"]),
             primary_exc,
         )
-        raw_result = get_analysis_llm().invoke([
-            SystemMessage(content=RERANK_SYSTEM_PROMPT),
-            HumanMessage(content=RERANK_FALLBACK_PROMPT.format(
-                query=fallback["query"],
-                cached_question=fallback["cached_question"],
-                cached_answer_excerpt=fallback["cached_answer_excerpt"],
-            )),
-        ])
         try:
-            return _parse_reranker_fallback_response(raw_result.content if hasattr(raw_result, "content") else str(raw_result)), 2, fallback["label"]
-        except Exception as fallback_exc:
-            raise RuntimeError(f"structured={primary_exc}; fallback={fallback_exc}") from fallback_exc
+            raw_result = get_analysis_llm().invoke([
+                SystemMessage(content=RERANK_SYSTEM_PROMPT),
+                HumanMessage(content=RERANK_FALLBACK_PROMPT.format(
+                    query=fallback["query"],
+                    cached_question=fallback["cached_question"],
+                    cached_answer_excerpt=fallback["cached_answer_excerpt"],
+                )),
+            ])
+        except Exception as fallback_invoke_exc:
+            logger.warning(
+                "   ⚠️ Fallback rerank 调用失败，安全降级为 reject | error=%s",
+                fallback_invoke_exc,
+            )
+            return _build_safe_reranker_reject("fallback_invoke_error"), 2, fallback["label"]
+
+        fallback_result = _parse_reranker_fallback_response(
+            raw_result.content if hasattr(raw_result, "content") else str(raw_result)
+        )
+        return fallback_result, 2, fallback["label"]
 
 def _normalize_reuse_mode(raw_mode: str) -> CacheReuseMode:
     mapped_modes = {
@@ -388,6 +505,89 @@ def _normalize_reuse_mode(raw_mode: str) -> CacheReuseMode:
     }
     return mapped_modes.get((raw_mode or "").strip().lower(), "reject")
 
+def _normalize_surface_text(text: str) -> str:
+    normalized = unicodedata.normalize("NFKC", str(text)).lower().strip()
+    collapsed = "".join(normalized.split())
+    allowed_chars = []
+    for char in collapsed:
+        if unicodedata.category(char).startswith("P"):
+            continue
+        allowed_chars.append(char)
+    return "".join(allowed_chars)
+
+def _split_query_segments(query: str) -> List[str]:
+    normalized = unicodedata.normalize("NFKC", str(query))
+    # 逗号常出现在单个子问题内部，不能一律视为复合问题分隔符。
+    for separator in ["？", "?", "！", "!", "。", "；", ";", "另外", "还有", "以及", "并且"]:
+        normalized = normalized.replace(separator, "\n")
+    segments = []
+    for segment in normalized.splitlines():
+        cleaned = segment.strip()
+        if len(cleaned) >= 2:
+            segments.append(cleaned)
+    return segments
+
+def _derive_deterministic_subquery_residual(query: str, cached_question: str) -> str:
+    normalized_cached_question = _normalize_surface_text(cached_question)
+    residual_segments = [
+        segment for segment in _split_query_segments(query)
+        if _normalize_surface_text(segment) != normalized_cached_question
+    ]
+    if len(residual_segments) != 1:
+        return ""
+    return residual_segments[0].strip()
+
+def _refine_residual_query(query: str, cached_question: str, residual_query: str) -> str:
+    """优先从原始复合问题中提炼真实缺口，避免 Reranker 输出过长的解释式 residual。"""
+    segments = _split_query_segments(query)
+    if len(segments) <= 1:
+        return residual_query.strip()
+
+    normalized_cached_question = _normalize_surface_text(cached_question)
+    normalized_residual_query = _normalize_surface_text(residual_query)
+    remaining_segments = [
+        segment for segment in segments
+        if _normalize_surface_text(segment) != normalized_cached_question
+    ]
+    if not remaining_segments:
+        return residual_query.strip()
+
+    if normalized_residual_query:
+        for segment in remaining_segments:
+            normalized_segment = _normalize_surface_text(segment)
+            if normalized_segment and (
+                normalized_segment in normalized_residual_query
+                or normalized_residual_query in normalized_segment
+            ):
+                return segment.strip()
+
+    return min(remaining_segments, key=len).strip()
+
+def _build_supplement_cache_writeback_entries(
+    original_query: str,
+    residual_query: str,
+    reranker_residual_query: str,
+    supplemental_answer: str,
+) -> List[Dict[str, str]]:
+    normalized_answer = supplemental_answer.strip().rstrip("。！？!?")
+    if not normalized_answer or normalized_answer == "无需补充":
+        return []
+
+    entries: List[Dict[str, str]] = []
+    seen_prompts = set()
+    normalized_original_query = _normalize_surface_text(original_query)
+    for prompt in [residual_query, reranker_residual_query]:
+        cleaned_prompt = (prompt or "").strip()
+        if len(cleaned_prompt) < 2:
+            continue
+        normalized_prompt = _normalize_surface_text(cleaned_prompt)
+        if not normalized_prompt or normalized_prompt == normalized_original_query or normalized_prompt in seen_prompts:
+            continue
+        entries.append({"prompt": cleaned_prompt, "answer": supplemental_answer})
+        seen_prompts.add(normalized_prompt)
+
+    return entries
+
 def _should_allow_partial_reuse(query: str, cached_answer: str, residual_query: str, score: float) -> Tuple[bool, str]:
     normalized_query = " ".join(query.split())
     normalized_residual = " ".join(residual_query.split())
@@ -399,11 +599,17 @@ def _should_allow_partial_reuse(query: str, cached_answer: str, residual_query: 
     residual_ratio = residual_length / query_length
     cached_answer_length = len(" ".join((cached_answer or "").split()))
 
-    if score < PARTIAL_REUSE_MIN_SCORE:
+    is_short_residual_candidate = (
+        residual_length <= PARTIAL_REUSE_SHORT_RESIDUAL_MAX_CHARS
+        and residual_ratio <= PARTIAL_REUSE_SHORT_RESIDUAL_MAX_RATIO
+    )
+    required_score = PARTIAL_REUSE_SHORT_RESIDUAL_MIN_SCORE if is_short_residual_candidate else PARTIAL_REUSE_MIN_SCORE
+
+    if score < required_score:
         return False, "partial收益不足"
     if residual_length > PARTIAL_REUSE_MAX_RESIDUAL_CHARS:
         return False, "缺口过长"
-    if residual_ratio > PARTIAL_REUSE_MAX_RESIDUAL_RATIO:
+    if residual_ratio > PARTIAL_REUSE_MAX_RESIDUAL_RATIO and not is_short_residual_candidate:
         return False, "缺口占比过高"
     if cached_answer_length > PARTIAL_REUSE_MAX_CACHED_ANSWER_CHARS:
         return False, "缓存答案过长"
@@ -455,6 +661,9 @@ def rerank_cache_node(state: WorkflowState) -> WorkflowState:
             "cache_rerank_attempt": "skipped",
             "cache_rerank_score": 0.0,
             "cache_rerank_reason": "no_cache_candidate",
+            "cache_reranker_reason": "",
+            "cache_validation_reason": "no_cache_candidate",
+            "cache_reranker_residual_query": "",
             "cache_residual_query": "",
             "execution_path": state.get("execution_path", []) + ["cache_rerank_skipped"],
         }
@@ -462,17 +671,31 @@ def rerank_cache_node(state: WorkflowState) -> WorkflowState:
     logger.info(f"⚖️ 启动缓存复用裁判: '{query[:20]}...' vs 缓存问题 '{cached_question[:20]}...'")
 
     llm_calls = state.get("llm_calls", {}).copy()
+    original_residual_query = ""
     try:
         result, rerank_call_count, rerank_attempt_label = _invoke_reranker(query, cached_question, cached_answer)
         reuse_mode = _normalize_reuse_mode(result.reuse_mode)
         score = max(0.0, min(1.0, float(result.score)))
-        reason = result.reason or ""
-        residual_query = (result.residual_query or "").strip()
+        reranker_reason = result.reason or ""
+        validation_reason = ""
+        reason = reranker_reason
+        original_residual_query = (result.residual_query or "").strip()
+        residual_query = _refine_residual_query(query, cached_question, original_residual_query)
+        if original_residual_query and residual_query != original_residual_query:
+            logger.info(
+                "   ✂️ Residual 精简[%s]: '%s' -> '%s'",
+                rerank_attempt_label,
+                original_residual_query,
+                residual_query,
+            )
     except Exception as e:
         logger.exception(f"   ❌ Reranker 调用失败，安全降级: {e}")
         reuse_mode = "reject"
         score = 0.0
-        reason = f"rerank_exception: {e}"
+        reranker_reason = f"rerank_exception: {e}"
+        validation_reason = ""
+        reason = reranker_reason
+        original_residual_query = ""
         residual_query = ""
         rerank_call_count = 2
         rerank_attempt_label = "failed"
@@ -480,9 +703,17 @@ def rerank_cache_node(state: WorkflowState) -> WorkflowState:
     if reuse_mode == "partial_reuse":
         allow_partial_reuse, rejection_reason = _should_allow_partial_reuse(query, cached_answer, residual_query, score)
         if not allow_partial_reuse:
+            validation_reason = rejection_reason or "partial收益不足"
             reuse_mode = "reject"
-            reason = rejection_reason or reason or "partial收益不足"
-            residual_query = ""
+            reason = validation_reason
+            logger.info(
+                "   🧱 Partial reuse 后置校验拒绝[%s] (score=%.2f): reranker_reason=%s | validation_reason=%s | residual=%s",
+                rerank_attempt_label,
+                score,
+                reranker_reason or "无",
+                validation_reason,
+                residual_query or "无",
+            )
 
     llm_calls["analysis_llm"] = llm_calls.get("analysis_llm", 0) + rerank_call_count
     rerank_time = (time.perf_counter() - start_time) * 1000
@@ -497,6 +728,9 @@ def rerank_cache_node(state: WorkflowState) -> WorkflowState:
             "cache_rerank_attempt": rerank_attempt_label,
             "cache_rerank_score": score,
             "cache_rerank_reason": reason,
+            "cache_reranker_reason": reranker_reason,
+            "cache_validation_reason": validation_reason,
+            "cache_reranker_residual_query": original_residual_query,
             "cache_residual_query": "",
             "execution_path": state.get("execution_path", []) + ["cache_reranked_passed"],
             "llm_calls": llm_calls,
@@ -514,6 +748,9 @@ def rerank_cache_node(state: WorkflowState) -> WorkflowState:
             "cache_rerank_attempt": rerank_attempt_label,
             "cache_rerank_score": score,
             "cache_rerank_reason": reason,
+            "cache_reranker_reason": reranker_reason,
+            "cache_validation_reason": validation_reason,
+            "cache_reranker_residual_query": original_residual_query,
             "cache_residual_query": residual_query,
             "execution_path": state.get("execution_path", []) + ["cache_reranked_partial"],
             "llm_calls": llm_calls,
@@ -530,7 +767,10 @@ def rerank_cache_node(state: WorkflowState) -> WorkflowState:
             "cache_rerank_attempt": rerank_attempt_label,
             "cache_rerank_score": score,
             "cache_rerank_reason": reason,
-            "cache_residual_query": "",
+                "cache_reranker_reason": reranker_reason,
+                "cache_validation_reason": validation_reason,
+                "cache_reranker_residual_query": original_residual_query,
+                "cache_residual_query": residual_query,
             "execution_path": state.get("execution_path", []) + ["cache_reranked_failed"],
             "llm_calls": llm_calls,
             "metrics": metrics,
@@ -634,6 +874,7 @@ def research_supplement_node(state: WorkflowState) -> WorkflowState:
     start_time = time.perf_counter()
     original_query = state["query"]
     residual_query = state.get("cache_residual_query") or original_query
+    reranker_residual_query = state.get("cache_reranker_residual_query") or residual_query
     cached_answer = state.get("cache_base_answer") or state.get("answer") or ""
 
     logger.info(f"🔎 正在补充研究缺口: '{residual_query}'")
@@ -660,6 +901,13 @@ def research_supplement_node(state: WorkflowState) -> WorkflowState:
             logger.exception(f"   ❌ 合并部分复用回答失败，降级为模板拼接: {e}")
             final_answer = f"{cached_answer}\n\n补充说明：\n{supplemental_answer}"
 
+    cache_writeback_entries = _build_supplement_cache_writeback_entries(
+        original_query=original_query,
+        residual_query=residual_query,
+        reranker_residual_query=reranker_residual_query,
+        supplemental_answer=supplemental_answer,
+    )
+
     llm_calls = state.get("llm_calls", {}).copy()
     llm_calls["research_llm"] = llm_calls.get("research_llm", 0) + research_llm_invocations + merge_llm_invocations
 
@@ -674,10 +922,61 @@ def research_supplement_node(state: WorkflowState) -> WorkflowState:
         **state,
         "answer": final_answer,
         "research_iterations": state.get("research_iterations", 0) + 1,
+        "cache_writeback_entries": cache_writeback_entries,
         "execution_path": state["execution_path"] + ["supplement_researched"],
         "llm_calls": llm_calls,
         "metrics": metrics,
     }
+
+def _store_cache_entry(prompt: str, answer: str) -> None:
+    if not _cache_instance or not prompt or not answer:
+        return
+
+    _cache_instance.cache.store(prompt=prompt, response=answer)
+
+    if not hasattr(_cache_instance, '_seed_id_by_question'):
+        _cache_instance._seed_id_by_question = {}
+    if not hasattr(_cache_instance, '_answer_by_question'):
+        _cache_instance._answer_by_question = {}
+    if not hasattr(_cache_instance, '_normalized_question_map'):
+        _cache_instance._normalized_question_map = {}
+    if not hasattr(_cache_instance, '_near_exact_question_map'):
+        _cache_instance._near_exact_question_map = {}
+
+    _cache_instance._seed_id_by_question[prompt] = None
+    _cache_instance._answer_by_question[prompt] = answer
+    if hasattr(_cache_instance, 'normalize_query'):
+        _cache_instance._normalized_question_map[_cache_instance.normalize_query(prompt)] = prompt
+    if hasattr(_cache_instance, 'normalize_surface_query'):
+        _cache_instance._near_exact_question_map[_cache_instance.normalize_surface_query(prompt)] = prompt
+
+def _cache_contains_prompt_variant(prompt: str) -> bool:
+    if not _cache_instance or not prompt:
+        return False
+
+    if hasattr(_cache_instance, 'normalize_query'):
+        normalized_prompt = _cache_instance.normalize_query(prompt)
+        if normalized_prompt in getattr(_cache_instance, '_normalized_question_map', {}):
+            return True
+
+    if hasattr(_cache_instance, 'normalize_surface_query'):
+        normalized_surface_prompt = _cache_instance.normalize_surface_query(prompt)
+        if normalized_surface_prompt in getattr(_cache_instance, '_near_exact_question_map', {}):
+            return True
+
+    return False
+
+def _cache_segments_background(segments: List[str]) -> None:
+    """后台线程：对每个子问题段落独立调用 RAG 生成精准答案并写入缓存。
+    以 daemon 线程运行，不阻塞主线程/用户响应。"""
+    for segment in segments:
+        try:
+            logger.info(f"   🔍 [后台] 为子问题段落研究精准答案: '{segment[:20]}...'")
+            segment_answer, _ = execute_research(segment)
+            _store_cache_entry(segment, segment_answer)
+            logger.info(f"   💾 [后台] 子问题缓存写入完成: '{segment[:20]}...'")
+        except Exception as exc:
+            logger.warning(f"   ⚠️ [后台] 子问题缓存失败，跳过: '{segment[:20]}...' | error={exc}")
 
 def synthesize_response_node(state: WorkflowState) -> WorkflowState:
     """节点：合成最终用户响应（并执行缓存写回）"""
@@ -687,6 +986,25 @@ def synthesize_response_node(state: WorkflowState) -> WorkflowState:
     
     # 获取最核心的答案呈现给用户
     final_response = state['answer']
+    executed_paths = set(state.get("execution_path", []))
+    cache_written_prompts: List[str] = []
+    normalized_written_prompts = set()
+
+    for prompt in state.get("cache_written_prompts", []) or []:
+        cleaned_prompt = (prompt or "").strip()
+        normalized_prompt = _normalize_surface_text(cleaned_prompt)
+        if not cleaned_prompt or not normalized_prompt or normalized_prompt in normalized_written_prompts:
+            continue
+        cache_written_prompts.append(cleaned_prompt)
+        normalized_written_prompts.add(normalized_prompt)
+
+    def remember_written_prompt(prompt: str) -> None:
+        cleaned_prompt = (prompt or "").strip()
+        normalized_prompt = _normalize_surface_text(cleaned_prompt)
+        if not cleaned_prompt or not normalized_prompt or normalized_prompt in normalized_written_prompts:
+            return
+        cache_written_prompts.append(cleaned_prompt)
+        normalized_written_prompts.add(normalized_prompt)
     
     # --- 【自学习逻辑】：将研究阶段产出的新答案回填至语义缓存 ---
     # 仅当本次回答来自 research（不是缓存直出，也不是 pre_check 拦截）且答案非空时，才写回缓存。
@@ -695,27 +1013,68 @@ def synthesize_response_node(state: WorkflowState) -> WorkflowState:
         and not state.get("intercepted", False)
         and _cache_instance
         and final_response
-        and ({"researched", "supplement_researched"} & set(state.get("execution_path", [])))
+        and ({"researched", "supplement_researched"} & executed_paths)
     ):
-        logger.info(f"   💾 将研究得到的回答写入语义缓存: '{state['query'][:20]}...'")
-        _cache_instance.cache.store(prompt=state["query"], response=state["answer"])
+        query_segments = _split_query_segments(state["query"])
+        is_compound_query = len(query_segments) > 1
 
-        # 手动维护内存字典供 fuzzy_matches 短路使用
-        if not hasattr(_cache_instance, '_seed_id_by_question'):
-            _cache_instance._seed_id_by_question = {}
-        if not hasattr(_cache_instance, '_answer_by_question'):
-            _cache_instance._answer_by_question = {}
-        if not hasattr(_cache_instance, '_normalized_question_map'):
-            _cache_instance._normalized_question_map = {}
-        if not hasattr(_cache_instance, '_near_exact_question_map'):
-            _cache_instance._near_exact_question_map = {}
+        # 复合问题只存子问题段落，不存完整原始问题，避免缓存污染。
+        # 单问题正常写入完整 query。
+        if not is_compound_query:
+            logger.info(f"   💾 将研究得到的回答写入语义缓存: '{state['query'][:20]}...'")
+            _store_cache_entry(state["query"], state["answer"])
+            remember_written_prompt(state["query"])
 
-        _cache_instance._seed_id_by_question[state["query"]] = None
-        _cache_instance._answer_by_question[state["query"]] = state["answer"]
-        if hasattr(_cache_instance, 'normalize_query'):
-            _cache_instance._normalized_question_map[_cache_instance.normalize_query(state["query"])] = state["query"]
-        if hasattr(_cache_instance, 'normalize_surface_query'):
-            _cache_instance._near_exact_question_map[_cache_instance.normalize_surface_query(state["query"])] = state["query"]
+        # written_prompts 仍以完整 query 初始化，用作 dedup 屏障，
+        # 防止子问题段落恰好与完整 query 重复写入。
+        extra_cache_entries = state.get("cache_writeback_entries") or []
+        written_prompts = {_normalize_surface_text(state["query"])}
+        for entry in extra_cache_entries:
+            prompt = (entry.get("prompt") or "").strip()
+            answer = (entry.get("answer") or "").strip()
+            normalized_prompt = _normalize_surface_text(prompt)
+            if not prompt or not answer or normalized_prompt in written_prompts:
+                continue
+            logger.info(f"   💾 将补充研究得到的子问题答案写入缓存: '{prompt[:20]}...'")
+            _store_cache_entry(prompt, answer)
+            remember_written_prompt(prompt)
+            written_prompts.add(normalized_prompt)
+
+        # 对 Full RAG 路径，将复合问题中的子问题段落写入缓存（后台异步）。
+        # 每个段落独立调用 RAG 以获取精准答案，在后台 daemon 线程中完成，
+        # 不阻塞主线程，用户可立即接收响应并继续输入。
+        if "researched" in executed_paths:
+            pending_segments = []
+            for segment in _split_query_segments(state["query"]):
+                if len(segment) < 4:
+                    continue
+                normalized_segment = _normalize_surface_text(segment)
+                if not normalized_segment or normalized_segment in written_prompts:
+                    continue
+                if _cache_contains_prompt_variant(segment):
+                    continue
+                pending_segments.append(segment)
+                # 提前记录为"已写"（后台线程会很快完成），避免同会话重复调度。
+                remember_written_prompt(segment)
+                written_prompts.add(normalized_segment)
+            if pending_segments:
+                threading.Thread(
+                    target=_cache_segments_background,
+                    args=(pending_segments,),
+                    daemon=True,
+                ).start()
+
+    if (
+        state.get("cache_reuse_mode") == "full_reuse"
+        and state.get("cache_rerank_passed", False)
+        and not state.get("intercepted", False)
+        and _cache_instance
+        and final_response
+        and not _cache_contains_prompt_variant(state["query"])
+    ):
+        logger.info(f"   💾 将 full_reuse 接受后的当前问法写入缓存: '{state['query'][:20]}...'")
+        _store_cache_entry(state["query"], final_response)
+        remember_written_prompt(state["query"])
     
     # 合成耗时统计
     synth_time = (time.perf_counter() - start_time) * 1000
@@ -725,6 +1084,7 @@ def synthesize_response_node(state: WorkflowState) -> WorkflowState:
     return {
         **state,
         "final_response": final_response,
+        "cache_written_prompts": cache_written_prompts,
         "execution_path": state["execution_path"] + ["synthesized"],
         "llm_calls": llm_calls,
         "metrics": metrics,

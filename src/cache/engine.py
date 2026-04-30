@@ -5,7 +5,14 @@ from pydantic import BaseModel
 from redisvl.extensions.cache.embeddings import EmbeddingsCache
 from redisvl.extensions.cache.llm import SemanticCache
 from redisvl.utils.vectorize import HFTextVectorizer
-from common.env import REDIS_URL, CACHE_NAME, CACHE_DISTANCE_THRESHOLD, CACHE_L1_EXACT_ENABLED
+from common.env import (
+    REDIS_URL,
+    CACHE_NAME,
+    CACHE_DISTANCE_THRESHOLD,
+    CACHE_L1_EXACT_ENABLED,
+    CACHE_L1_EDIT_DISTANCE_ENABLED,
+    CACHE_L1_EDIT_DISTANCE_MAX_DISTANCE,
+)
 
 class CacheResult(BaseModel):
     prompt: str
@@ -122,6 +129,66 @@ class SemanticCacheWrapper:
 
         return None
 
+    @staticmethod
+    def _levenshtein_distance_with_limit(source: str, target: str, max_distance: int) -> Optional[int]:
+        if source == target:
+            return 0
+        if abs(len(source) - len(target)) > max_distance:
+            return None
+        if not source:
+            return len(target) if len(target) <= max_distance else None
+        if not target:
+            return len(source) if len(source) <= max_distance else None
+
+        previous_row = list(range(len(target) + 1))
+        for row_index, source_char in enumerate(source, start=1):
+            current_row = [row_index]
+            row_min = row_index
+            for col_index, target_char in enumerate(target, start=1):
+                insertions = previous_row[col_index] + 1
+                deletions = current_row[col_index - 1] + 1
+                substitutions = previous_row[col_index - 1] + (source_char != target_char)
+                current_value = min(insertions, deletions, substitutions)
+                current_row.append(current_value)
+                row_min = min(row_min, current_value)
+            if row_min > max_distance:
+                return None
+            previous_row = current_row
+
+        distance = previous_row[-1]
+        return distance if distance <= max_distance else None
+
+    def find_edit_distance_candidate(self, query: str) -> Optional[CacheResult]:
+        """用小编辑距离识别错别字、同音字和 OCR 噪声。"""
+        normalized_query = self.normalize_surface_query(query)
+        best_match = None
+        best_distance = None
+
+        for normalized_candidate, original_question in self._near_exact_question_map.items():
+            distance = self._levenshtein_distance_with_limit(
+                normalized_query,
+                normalized_candidate,
+                CACHE_L1_EDIT_DISTANCE_MAX_DISTANCE,
+            )
+            if distance is None:
+                continue
+            if best_distance is None or distance < best_distance:
+                best_distance = distance
+                best_match = original_question
+
+        if best_match is None or best_distance is None:
+            return None
+
+        print(f"⚡ [编辑距离命中] edit-distance hit: '{query}' -> '{best_match}' (distance={best_distance})")
+        return CacheResult(
+            prompt=best_match,
+            response=self._answer_by_question[best_match],
+            vector_distance=0.0,
+            cosine_similarity=max(0.0, 1.0 - best_distance / max(len(normalized_query), 1)),
+            seed_id=self._seed_id_by_question.get(best_match),
+            match_type="edit_distance",
+        )
+
     def clear(self):
         """物理清空整个向量索引和相关数据"""
         print("正在彻底清空旧语义缓存数据...")
@@ -193,6 +260,11 @@ class SemanticCacheWrapper:
                         match_type="near_exact",
                     )
                 ])
+
+            if CACHE_L1_EDIT_DISTANCE_ENABLED:
+                edit_distance_candidate = self.find_edit_distance_candidate(query)
+                if edit_distance_candidate:
+                    return CacheResults(query=query, matches=[edit_distance_candidate])
 
             subquery_candidate = self.find_subquery_candidate(query)
             if subquery_candidate:

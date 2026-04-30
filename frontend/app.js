@@ -22,7 +22,6 @@ document.addEventListener('DOMContentLoaded', () => {
     const setRequestLocked = (locked) => {
         isRequestLocked = locked;
         sendBtn.disabled = locked;
-        userInput.disabled = locked;
         quickPills.forEach((pill) => {
             pill.classList.toggle('pointer-events-none', locked);
             pill.classList.toggle('opacity-50', locked);
@@ -204,6 +203,10 @@ document.addEventListener('DOMContentLoaded', () => {
             text: '✨ Near-Exact Cache Hit',
             classes: 'bg-teal-50 dark:bg-teal-500/10 text-teal-700 dark:text-teal-400 border border-teal-200 dark:border-teal-500/20 rounded-full font-medium tracking-wide transition-colors'
         },
+        cache_edit_distance: {
+            text: '🪶 Edit-Distance Cache Hit',
+            classes: 'bg-cyan-50 dark:bg-cyan-500/10 text-cyan-700 dark:text-cyan-400 border border-cyan-200 dark:border-cyan-500/20 rounded-full font-medium tracking-wide transition-colors'
+        },
         cache_semantic_reuse: {
             text: '🧠 Reranked Cache Reuse',
             classes: 'bg-green-50 dark:bg-green-500/10 text-green-700 dark:text-green-400 border border-green-200 dark:border-green-500/20 rounded-full font-medium tracking-wide transition-colors'
@@ -226,6 +229,8 @@ document.addEventListener('DOMContentLoaded', () => {
             fallbackLabelKey = 'cache_exact';
         } else if (meta.cache_match_type === 'near_exact') {
             fallbackLabelKey = 'cache_near_exact';
+        } else if (meta.cache_match_type === 'edit_distance') {
+            fallbackLabelKey = 'cache_edit_distance';
         } else if (meta.cache_reuse_mode === 'partial_reuse') {
             fallbackLabelKey = 'cache_partial_reuse';
         } else if (meta.cache_reuse_mode === 'full_reuse') {

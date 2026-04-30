@@ -1,4 +1,5 @@
 import csv
+import json
 import os
 from typing import Dict, List
 
@@ -44,8 +45,15 @@ def export_results(all_results: List[Dict], total_wall_time_sec: float, output_d
     def is_near_exact_bypass(result: Dict) -> bool:
         return result.get("cache_hit", False) and result.get("cache_match_type") == "near_exact"
 
+    def is_edit_distance_bypass(result: Dict) -> bool:
+        return result.get("cache_hit", False) and result.get("cache_match_type") == "edit_distance"
+
     def is_rerank_candidate(result: Dict) -> bool:
-        return bool(result.get("cache_matched_question")) and result.get("cache_match_type") not in {"exact", "near_exact", "none"}
+        return (
+            bool(result.get("cache_matched_question"))
+            and result.get("cache_match_type") not in {"exact", "near_exact", "none"}
+            and result.get("cache_rerank_attempt") not in {"skipped", "none"}
+        )
 
     def is_reranked_full_reuse(result: Dict) -> bool:
         return is_rerank_candidate(result) and result.get("cache_reuse_mode") == "full_reuse"
@@ -63,6 +71,8 @@ def export_results(all_results: List[Dict], total_wall_time_sec: float, output_d
             return "精确缓存直出"
         if is_near_exact_bypass(result):
             return "近精确缓存直出"
+        if is_edit_distance_bypass(result):
+            return "编辑距离缓存直出"
         if is_reranked_full_reuse(result):
             return "Reranker完整复用"
         if is_partial_reuse(result):
@@ -89,7 +99,10 @@ def export_results(all_results: List[Dict], total_wall_time_sec: float, output_d
                 "cache_rerank_attempt",
                 "cache_rerank_score",
                 "cache_rerank_reason",
+                "cache_reranker_reason",
+                "cache_validation_reason",
                 "cache_residual_query",
+                "cache_written_prompts",
                 "analysis_llm_calls",
                 "research_llm_calls",
                 "total_llm_calls",
@@ -128,7 +141,10 @@ def export_results(all_results: List[Dict], total_wall_time_sec: float, output_d
                     "cache_rerank_attempt": result.get("cache_rerank_attempt", "none"),
                     "cache_rerank_score": f"{result.get('cache_rerank_score', 0.0):.4f}",
                     "cache_rerank_reason": result.get("cache_rerank_reason", ""),
+                    "cache_reranker_reason": result.get("cache_reranker_reason", ""),
+                    "cache_validation_reason": result.get("cache_validation_reason", ""),
                     "cache_residual_query": result.get("cache_residual_query", ""),
+                    "cache_written_prompts": json.dumps(result.get("cache_written_prompts", []) or [], ensure_ascii=False),
                     "analysis_llm_calls": llm_calls.get("analysis_llm", 0),
                     "research_llm_calls": llm_calls.get("research_llm", 0),
                     "total_llm_calls": total_llm_calls(result),
@@ -155,8 +171,11 @@ def export_results(all_results: List[Dict], total_wall_time_sec: float, output_d
     reranker_reject_paths = [r for r in rerank_candidates if r.get("cache_reuse_mode") == "reject"]
     reranker_exception_paths = [r for r in reranker_reject_paths if is_reranker_exception(r)]
     reranker_fallback_paths = [r for r in rerank_candidates if r.get("cache_rerank_attempt") == "fallback"]
+    deterministic_partial_paths = [r for r in partial_reuse_paths if r.get("cache_rerank_attempt") == "skipped"]
+    reranked_partial_paths = [r for r in partial_reuse_paths if r.get("cache_rerank_attempt") not in {"skipped", "none"}]
     exact_bypass_paths = [r for r in eligible_queries if is_exact_bypass(r)]
     near_exact_bypass_paths = [r for r in eligible_queries if is_near_exact_bypass(r)]
+    edit_distance_bypass_paths = [r for r in eligible_queries if is_edit_distance_bypass(r)]
     semantic_full_reuse_paths = [r for r in reranked_full_reuse_paths if r.get("cache_match_type") == "semantic"]
     subquery_full_reuse_paths = [r for r in reranked_full_reuse_paths if str(r.get("cache_match_type", "")).startswith("subquery_")]
 
@@ -217,18 +236,21 @@ def export_results(all_results: List[Dict], total_wall_time_sec: float, output_d
 可参与缓存查询数 : {eligible_count} 次
 缓存候选数     : {candidate_count} 次
 需要 Reranker 的候选数 : {rerank_candidate_count} 次
-直接缓存复用数 : {direct_reuse_count} 次
+直接缓存复用数（仅 cache_hit=True） : {direct_reuse_count} 次
 exact 旁路数   : {len(exact_bypass_paths)} 次
 near_exact 旁路数 : {len(near_exact_bypass_paths)} 次
+edit_distance 旁路数 : {len(edit_distance_bypass_paths)} 次
 Reranker full_reuse 数 : {len(reranked_full_reuse_paths)} 次
     其中 semantic full_reuse 数 : {len(semantic_full_reuse_paths)} 次
     其中 subquery full_reuse 数 : {len(subquery_full_reuse_paths)} 次
-partial_reuse 数 : {len(partial_reuse_paths)} 次
+partial_reuse 数（单列统计，不计入 direct cache hit） : {len(partial_reuse_paths)} 次
+    其中 deterministic subquery partial 数 : {len(deterministic_partial_paths)} 次
+    其中 reranker partial 数 : {len(reranked_partial_paths)} 次
 Reranker reject 数 : {len(reranker_reject_paths)} 次
 Reranker exception 数 : {len(reranker_exception_paths)} 次
 Reranker fallback 数 : {len(reranker_fallback_paths)} 次
 缓存候选率     : {candidate_hit_rate * 100:.2f}%
-直接缓存复用率 : {direct_cache_reuse_rate * 100:.2f}%
+直接缓存复用率（仅 cache_hit=True） : {direct_cache_reuse_rate * 100:.2f}%
 partial_reuse 率 : {hybrid_reuse_rate * 100:.2f}%
 测试总墙上时间 : {total_wall_time_sec:.2f} 秒
 

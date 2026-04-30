@@ -24,6 +24,8 @@ CACHE_NAME = os.getenv("CACHE_NAME", "semantic-cache")
 # - L1: exact fast path（归一化后的字符串精确命中）
 # - L2: semantic cache（当前仍由 RedisVL 承载）
 CACHE_L1_EXACT_ENABLED = os.getenv("CACHE_L1_EXACT_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+CACHE_L1_EDIT_DISTANCE_ENABLED = os.getenv("CACHE_L1_EDIT_DISTANCE_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+CACHE_L1_EDIT_DISTANCE_MAX_DISTANCE = int(os.getenv("CACHE_L1_EDIT_DISTANCE_MAX_DISTANCE", "1"))
 CACHE_L2_DISTANCE_THRESHOLD = float(os.getenv("CACHE_L2_DISTANCE_THRESHOLD", os.getenv("CACHE_DISTANCE_THRESHOLD", "0.2")))
 
 # 向量存储后端配置。目前代码实现仍落在 Redis；若后续迁移到 Qdrant，可优先替换这两个面向角色的配置。
