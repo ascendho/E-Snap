@@ -1,18 +1,31 @@
-from fastapi import FastAPI, Depends, HTTPException, status
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import Response
-from pydantic import BaseModel
+import asyncio
+import json
+import time
 import warnings
 import os
 import sys
+
+from fastapi import FastAPI, Depends, HTTPException, Request, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import Response, StreamingResponse
+from pydantic import BaseModel
 from common.env import set_ark_key
 from workflow.graph import create_agent_graph
-from workflow.nodes import build_initial_state
+from workflow.edges import cache_router, cache_rerank_router
+from workflow.nodes import (
+    build_initial_state,
+    check_cache_node,
+    get_research_llm,
+    pre_check_node,
+    prepare_research_messages,
+    research_supplement_node,
+    rerank_cache_node,
+    synthesize_response_node,
+)
 from knowledge.builder import init_app_knowledge_base
 from cache.auto_heater import setup_cache
 from common.logger import setup_logging
-import time
 from redis import Redis
 
 warnings.simplefilter("ignore")
@@ -98,6 +111,10 @@ class ChatResponse(BaseModel):
     latency_ms: float
     cache_hit: bool
     intercepted: bool
+    cache_match_type: str
+    cache_reuse_mode: str
+    label_key: str
+    label_text: str
 
 class ValidateRequest(BaseModel):
     access_code: str
@@ -128,26 +145,17 @@ def check_rate_limit(ip: str):
     redis_client.incr(key)
     redis_client.expire(key, 60)
 
-@app.post("/validate")
-async def validate_code(request: ValidateRequest):
-    if request.access_code != ACCESS_CODE:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid Access Code"
-        )
-    return {"status": "ok", "message": "Access code is valid"}
+def get_client_ip(request: Request) -> str:
+    return request.client.host if request.client and request.client.host else "127.0.0.1"
 
-@app.post("/chat", response_model=ChatResponse)
-async def chat_endpoint(request: ChatRequest, client_ip: str = "127.0.0.1"):
-    # 1. Security Check: Validate Access Code
-    if request.access_code != ACCESS_CODE:
+def validate_chat_request(payload: ChatRequest, client_ip: str):
+    if payload.access_code != ACCESS_CODE:
         logger.warning(f"Failed authorization attempt from {client_ip}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid Access Code. Please use the code provided in the resume."
         )
 
-    # 2. Runtime Readiness Check
     if not system_status["ready"] or workflow_app is None:
         if system_status["stage"] == "error":
             raise HTTPException(
@@ -158,33 +166,233 @@ async def chat_endpoint(request: ChatRequest, client_ip: str = "127.0.0.1"):
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Backend is still initializing. Wait until the terminal shows 'Application startup complete.' and retry."
         )
-    
-    # 3. Security Check: Rate Limiting
+
     check_rate_limit(client_ip)
-    
-    # 4. Process the query using LangGraph
-    logger.info(f"Processing API Query: {request.query}")
+
+def build_label_metadata(final_state: dict) -> dict:
+    intercepted = final_state.get("intercepted", False)
+    cache_hit = final_state.get("cache_hit", False)
+    cache_match_type = final_state.get("cache_match_type", "none")
+    cache_reuse_mode = final_state.get("cache_reuse_mode", "none")
+
+    if intercepted:
+        label_key = "zero_intercept"
+        label_text = "Zero-Layer Intercept"
+    elif cache_hit and cache_match_type == "exact":
+        label_key = "cache_exact"
+        label_text = "Exact Cache Hit"
+    elif cache_hit and cache_match_type == "near_exact":
+        label_key = "cache_near_exact"
+        label_text = "Near-Exact Cache Hit"
+    elif cache_reuse_mode == "full_reuse":
+        label_key = "cache_semantic_reuse"
+        label_text = "Reranked Cache Reuse"
+    elif cache_reuse_mode == "partial_reuse":
+        label_key = "cache_partial_reuse"
+        label_text = "Partial Cache Reuse + RAG"
+    else:
+        label_key = "rag_full_research"
+        label_text = "LLM Analysis / Full RAG"
+
+    return {
+        "cache_hit": cache_hit,
+        "intercepted": intercepted,
+        "cache_match_type": cache_match_type,
+        "cache_reuse_mode": cache_reuse_mode,
+        "label_key": label_key,
+        "label_text": label_text,
+    }
+
+def build_chat_response(final_state: dict, latency_ms: float) -> ChatResponse:
+    answer = final_state.get("final_response", "系统遇到了未知错误，请稍后重试。")
+    metadata = build_label_metadata(final_state)
+    return ChatResponse(answer=answer, latency_ms=latency_ms, **metadata)
+
+def build_stream_final_event(final_state: dict, latency_ms: float, answer: str) -> dict:
+    return {
+        "answer": answer,
+        "latency_ms": latency_ms,
+        **build_label_metadata(final_state),
+    }
+
+def stream_event(event_type: str, **payload) -> str:
+    return json.dumps({"type": event_type, **payload}, ensure_ascii=False) + "\n"
+
+def iter_text_chunks(text: str, chunk_size: int = 24):
+    for start in range(0, len(text), chunk_size):
+        yield text[start:start + chunk_size]
+
+def extract_chunk_text(chunk) -> str:
+    content = getattr(chunk, "content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                parts.append(str(item.get("text", "")))
+            else:
+                parts.append(str(item))
+        return "".join(parts)
+    return str(content or "")
+
+@app.post("/validate")
+async def validate_code(request: ValidateRequest):
+    if request.access_code != ACCESS_CODE:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid Access Code"
+        )
+    return {"status": "ok", "message": "Access code is valid"}
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat_endpoint(payload: ChatRequest, request: Request):
+    client_ip = get_client_ip(request)
+    validate_chat_request(payload, client_ip)
+
+    logger.info(f"Processing API Query: {payload.query}")
     start_time = time.time()
     
     try:
-        initial_state = build_initial_state(request.query)
+        initial_state = build_initial_state(payload.query)
         
         # Invoke the workflow graph
         final_state = workflow_app.invoke(initial_state)
         
         latency = round((time.time() - start_time) * 1000, 2)
-        answer = final_state.get("final_response", "系统遇到了未知错误，请稍后重试。")
-        cache_hit = final_state.get("cache_hit", False)
-        intercepted = final_state.get("intercepted", False)
+        response = build_chat_response(final_state, latency)
         
-        logger.info(f"Answer generated in {latency}ms (Cache Hit: {cache_hit}, Intercepted: {intercepted})")
-        return ChatResponse(answer=answer, latency_ms=latency, cache_hit=cache_hit, intercepted=intercepted)
+        logger.info(f"Answer generated in {latency}ms (Cache Hit: {response.cache_hit}, Intercepted: {response.intercepted})")
+        return response
 
     except HTTPException:
         raise
     except Exception:
         logger.exception("Error processing query")
         raise HTTPException(status_code=500, detail="An internal error occurred while processing your request.")
+
+@app.post("/chat/stream")
+async def chat_stream_endpoint(payload: ChatRequest, request: Request):
+    client_ip = get_client_ip(request)
+    validate_chat_request(payload, client_ip)
+
+    async def event_generator():
+        start_time = time.time()
+        try:
+            logger.info(f"Processing streaming API Query: {payload.query}")
+            state = build_initial_state(payload.query)
+
+            yield stream_event("status", stage="pre_check", message="正在进行前置校验...")
+            await asyncio.sleep(0)
+            state = pre_check_node(state)
+
+            if state.get("intercepted", False):
+                state = synthesize_response_node(state)
+                answer = state.get("final_response", "")
+                for chunk in iter_text_chunks(answer):
+                    yield stream_event("token", content=chunk)
+                    await asyncio.sleep(0)
+                latency = round((time.time() - start_time) * 1000, 2)
+                yield stream_event("final", **build_stream_final_event(state, latency, answer))
+                return
+
+            yield stream_event("status", stage="check_cache", message="正在检查缓存...")
+            await asyncio.sleep(0)
+            state = check_cache_node(state)
+            route = cache_router(state)
+
+            if route == "synthesize_response":
+                state = synthesize_response_node(state)
+                answer = state.get("final_response", "")
+                for chunk in iter_text_chunks(answer):
+                    yield stream_event("token", content=chunk)
+                    await asyncio.sleep(0)
+                latency = round((time.time() - start_time) * 1000, 2)
+                yield stream_event("final", **build_stream_final_event(state, latency, answer))
+                return
+
+            if route == "rerank_cache":
+                yield stream_event("status", stage="rerank_cache", message="正在进行缓存语义裁判...")
+                await asyncio.sleep(0)
+                state = rerank_cache_node(state)
+                route = cache_rerank_router(state)
+                if route == "synthesize_response":
+                    state = synthesize_response_node(state)
+                    answer = state.get("final_response", "")
+                    for chunk in iter_text_chunks(answer):
+                        yield stream_event("token", content=chunk)
+                        await asyncio.sleep(0)
+                    latency = round((time.time() - start_time) * 1000, 2)
+                    yield stream_event("final", **build_stream_final_event(state, latency, answer))
+                    return
+                if route == "research_supplement":
+                    yield stream_event("status", stage="research_supplement", message="正在补充缓存未覆盖的部分...")
+                    await asyncio.sleep(0)
+                    state = research_supplement_node(state)
+                    state = synthesize_response_node(state)
+                    answer = state.get("final_response", "")
+                    for chunk in iter_text_chunks(answer):
+                        yield stream_event("token", content=chunk)
+                        await asyncio.sleep(0)
+                    latency = round((time.time() - start_time) * 1000, 2)
+                    yield stream_event("final", **build_stream_final_event(state, latency, answer))
+                    return
+
+            yield stream_event("status", stage="research", message="正在检索知识库并生成回答...")
+            await asyncio.sleep(0)
+            messages, research_llm_invocations, needs_final_generation = prepare_research_messages(payload.query)
+
+            if needs_final_generation:
+                assembled_answer = ""
+                for chunk in get_research_llm().stream(messages):
+                    piece = extract_chunk_text(chunk)
+                    if not piece:
+                        continue
+                    assembled_answer += piece
+                    yield stream_event("token", content=piece)
+                    await asyncio.sleep(0)
+                state = {
+                    **state,
+                    "answer": assembled_answer,
+                    "research_iterations": state.get("research_iterations", 0) + 1,
+                    "execution_path": state.get("execution_path", []) + ["researched"],
+                    "llm_calls": {
+                        **state.get("llm_calls", {}),
+                        "research_llm": state.get("llm_calls", {}).get("research_llm", 0) + research_llm_invocations + 1,
+                    },
+                }
+            else:
+                final_message = messages[-1]
+                assembled_answer = getattr(final_message, "content", "") or str(final_message)
+                for chunk in iter_text_chunks(assembled_answer):
+                    yield stream_event("token", content=chunk)
+                    await asyncio.sleep(0)
+                state = {
+                    **state,
+                    "answer": assembled_answer,
+                    "research_iterations": state.get("research_iterations", 0) + 1,
+                    "execution_path": state.get("execution_path", []) + ["researched"],
+                    "llm_calls": {
+                        **state.get("llm_calls", {}),
+                        "research_llm": state.get("llm_calls", {}).get("research_llm", 0) + research_llm_invocations,
+                    },
+                }
+
+            state = synthesize_response_node(state)
+            latency = round((time.time() - start_time) * 1000, 2)
+            yield stream_event("final", **build_stream_final_event(state, latency, state.get("final_response", assembled_answer)))
+        except Exception as exc:
+            logger.exception("Error processing streaming query")
+            yield stream_event("error", message=str(exc) or "An internal error occurred while processing your request.")
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="application/x-ndjson",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.get("/favicon.ico", include_in_schema=False)

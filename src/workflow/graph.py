@@ -9,6 +9,7 @@ from workflow.nodes import (
     check_cache_node,         # 节点1：检查语义缓存
     rerank_cache_node,        # 节点1.5：LLM Reranker，判定缓存答案能否复用
     research_node,            # 节点2：执行搜索/研究
+    research_supplement_node, # 节点2.5：仅补充缓存未覆盖的部分
     synthesize_response_node, # 节点3：整合资料并生成回答
 )
 # 导入边缘路由函数：决定流程走向的逻辑（Decision）
@@ -43,6 +44,7 @@ def create_agent_graph(sys_cache=None, kb_index=None, embeddings=None) -> StateG
     workflow.add_node("check_cache", check_cache_node)           # 缓存检查节点
     workflow.add_node("rerank_cache", rerank_cache_node)         # 缓存复用裁判节点（LLM Reranker）
     workflow.add_node("research", research_node)                 # 知识检索/研究节点
+    workflow.add_node("research_supplement", research_supplement_node) # 部分复用后的补充研究节点
     workflow.add_node("synthesize_response", synthesize_response_node) # 最终响应合成节点
 
     # 2. 设置入口点 (Entry Point)
@@ -63,6 +65,7 @@ def create_agent_graph(sys_cache=None, kb_index=None, embeddings=None) -> StateG
         "check_cache",
         cache_router,
         {
+            "synthesize_response": "synthesize_response",
             "rerank_cache": "rerank_cache",
             "research": "research"
         }
@@ -74,6 +77,7 @@ def create_agent_graph(sys_cache=None, kb_index=None, embeddings=None) -> StateG
         cache_rerank_router,
         {
             "synthesize_response": "synthesize_response",
+            "research_supplement": "research_supplement",
             "research": "research"
         }
     )
@@ -81,6 +85,7 @@ def create_agent_graph(sys_cache=None, kb_index=None, embeddings=None) -> StateG
     # 4. 配置普通边缘 (Normal Edges)
     # research 运行完后，直接进入 synthesize_response 生成最终回答
     workflow.add_edge("research", "synthesize_response")
+    workflow.add_edge("research_supplement", "synthesize_response")
 
     # 5. 设置终点
     # synthesize_response 运行完后，流程结束
@@ -88,7 +93,7 @@ def create_agent_graph(sys_cache=None, kb_index=None, embeddings=None) -> StateG
 
     # --- 日志记录与编译 ---
     logger = logging.getLogger("agentic-workflow")
-    logger.info("LangGraph 计算图构建完成，逻辑包含：语义缓存 -> Reranker -> 单轮RAG -> 动态路由")
+    logger.info("LangGraph 计算图构建完成，逻辑包含：快速缓存/子问题候选 -> 三态Reranker -> 补充研究/单轮RAG -> 动态路由")
 
     # 编译计算图，返回一个可执行的 app 对象
     return workflow.compile()

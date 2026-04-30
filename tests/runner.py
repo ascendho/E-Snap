@@ -18,13 +18,17 @@ def display_results(result: Dict[str, Any]) -> None:
     metrics = result.get("metrics", {})
     cache_hit = result.get("cache_hit", False)
     cache_conf = result.get("cache_confidence", 0.0)
+    cache_match_type = result.get("cache_match_type", "none")
+    cache_reuse_mode = result.get("cache_reuse_mode", "none")
 
     print("\n" + "=" * 60)
     print(f"🧐 查询: {query}")
     print("-" * 60)
     
     if cache_hit:
-        print(f"🟢 缓存状态: 命中 (置信度: {cache_conf:.2f})")
+        print(f"🟢 缓存状态: 命中[{cache_match_type}] (置信度: {cache_conf:.2f})")
+    elif cache_reuse_mode == "partial_reuse":
+        print(f"🟡 缓存状态: 部分复用[{cache_match_type}] (置信度: {cache_conf:.2f})")
     else:
         print("🔴 缓存状态: 未命中")
 
@@ -38,6 +42,21 @@ def display_results(result: Dict[str, Any]) -> None:
     print(result.get("final_response", ""))
     print("=" * 60 + "\n")
 
+def classify_result_path(result: Dict[str, Any]) -> str:
+    if result.get("intercepted", False):
+        return "拦截"
+    if result.get("cache_hit", False) and result.get("cache_match_type") == "exact":
+        return "精确缓存直出"
+    if result.get("cache_hit", False) and result.get("cache_match_type") == "near_exact":
+        return "近精确缓存直出"
+    if result.get("cache_reuse_mode") == "full_reuse":
+        return "Reranker完整复用"
+    if result.get("cache_reuse_mode") == "partial_reuse":
+        return "部分复用+补充研究"
+    if result.get("cache_matched_question"):
+        return "Reranker拒绝后研究"
+    return "完整研究"
+
 def analyze_agent_results(results: list) -> tuple:
     total_queries = len(results)
     total_cache_hits = sum(1 for r in results if r.get("cache_hit", False))
@@ -50,9 +69,8 @@ def analyze_agent_results(results: list) -> tuple:
         analysis_data = []
         for i, res in enumerate(results):
             metrics = res.get("metrics", {})
-            path = "拦截" if res.get("intercepted", False) else ("缓存复用" if res.get("cache_hit", False) else "研究")
             row = {
-                "path_type": path,
+                "path_type": classify_result_path(res),
                 "latency": metrics.get("total_latency", 0),
                 "total_llm_calls": sum(res.get("llm_calls", {}).values()),
             }

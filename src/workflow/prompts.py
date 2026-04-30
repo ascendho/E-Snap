@@ -27,18 +27,45 @@ RESEARCH_PROMPT_INITIAL = """
 """
 
 # 2. 缓存语义复用判断 Prompt（LLM Reranker）
-RERANK_SYSTEM_PROMPT = """你是语义缓存复用裁判，只做一个判断：旧答案能否直接回答新问题。
+RERANK_SYSTEM_PROMPT = """你是语义缓存复用裁判，需要在 full_reuse、partial_reuse、reject 三种模式中三选一。
 
 规则：
 1. 不要回答用户，只输出结构化判定。
-2. 只要对象、范围、条件、流程节点有关键差异，判定不可复用。
-3. 只要旧答案没有完整覆盖新问题，判定不可复用。
-4. 如果新问题中出现明显的错别字、同音字、OCR/ASR噪声，但结合旧问题和旧答案可以判断用户真实意图一致，则可以判定可复用。
-5. 不确定时判定不可复用。
-6. reason 只写一句极短中文理由，不超过20个字。"""
+2. full_reuse：旧答案已完整覆盖新问题，可直接复用。
+3. partial_reuse：旧答案只覆盖新问题的一部分；此时必须提供 residual_query，用一句独立、可检索的话描述尚未覆盖的部分。
+4. reject：旧答案不能安全复用，或者虽然有重叠但 residual_query 无法清晰提炼。
+5. 只要对象、范围、条件、流程节点有关键差异，就不能判成 full_reuse。
+6. 如果新问题中出现明显的错别字、同音字、OCR/ASR噪声，但结合旧问题和旧答案可以判断用户真实意图一致，则仍可判定 full_reuse。
+7. 不确定时优先选择 reject，而不是 partial_reuse。
+8. reason 只写一句极短中文理由，不超过20个字。"""
 
 RERANK_PROMPT = """新问题：{query}
 旧问题：{cached_question}
 旧答案摘要：{cached_answer_excerpt}
 
 请输出结构化判定。"""
+
+RESEARCH_PROMPT_SUPPLEMENT = """
+你正在补充回答一个用户问题中尚未覆盖的部分。
+
+原始用户问题：{original_query}
+已覆盖答案：{cached_answer}
+待补充的缺口问题：{residual_query}
+
+请只围绕“待补充的缺口问题”进行研究，不要重复已覆盖答案里的内容。
+如果缺口问题本身已经能从已覆盖答案中直接得到，请明确回答“无需补充”。
+"""
+
+PARTIAL_REUSE_MERGE_PROMPT = """
+请将下面两部分内容合并成一个最终答复，直接回答原始用户问题。
+
+原始用户问题：{original_query}
+已缓存且已覆盖的答案：{cached_answer}
+新补充的信息：{supplemental_answer}
+
+要求：
+1. 保留已缓存答案中的有效信息。
+2. 只补充新增信息，不要大段重复。
+3. 如果补充信息与缓存答案存在轻微重叠，请合并去重。
+4. 输出自然、完整、可直接发给用户的中文回答。
+"""

@@ -14,8 +14,21 @@ document.addEventListener('DOMContentLoaded', () => {
     const quickPills = document.querySelectorAll('.quick-pill');
 
     // Automatically adapt to current host domain for full-stack deployment
-    const API_URL = '/chat';
+    const CHAT_API_URL = '/chat/stream';
+    const VALIDATE_URL = '/validate';
     const HEALTH_URL = '/health';
+    let isRequestLocked = false;
+
+    const setRequestLocked = (locked) => {
+        isRequestLocked = locked;
+        sendBtn.disabled = locked;
+        userInput.disabled = locked;
+        quickPills.forEach((pill) => {
+            pill.classList.toggle('pointer-events-none', locked);
+            pill.classList.toggle('opacity-50', locked);
+            pill.setAttribute('aria-disabled', locked ? 'true' : 'false');
+        });
+    };
 
     // Theme Management
     if (localStorage.getItem('color-theme') === 'dark') {
@@ -95,7 +108,7 @@ document.addEventListener('DOMContentLoaded', () => {
         accessCodeInput.disabled = true;
         
         try {
-            const response = await fetch(API_URL.replace('/chat', '/validate'), {
+            const response = await fetch(VALIDATE_URL, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ access_code: val })
@@ -145,6 +158,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // Handle quick pills (Persistent)
     quickPills.forEach(pill => {
         pill.addEventListener('click', (e) => {
+            if (isRequestLocked) return;
             const presetTxt = e.currentTarget.lastElementChild ? e.currentTarget.lastElementChild.textContent.trim() : e.currentTarget.textContent.trim();
             handleSend(presetTxt);
         });
@@ -175,6 +189,50 @@ document.addEventListener('DOMContentLoaded', () => {
             return marked.parse(text);
         }
         return escapeHTML(text).replace(/\n/g, '<br/>');
+    };
+
+    const BADGE_CONFIG = {
+        zero_intercept: {
+            text: '🛡️ Zero-Layer Intercept',
+            classes: 'bg-yellow-50 dark:bg-yellow-500/10 text-yellow-700 dark:text-yellow-400 border border-yellow-200 dark:border-yellow-500/20 rounded-full font-medium tracking-wide shadow-sm transition-colors'
+        },
+        cache_exact: {
+            text: '⚡ Exact Cache Hit',
+            classes: 'bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-500/20 rounded-full font-medium tracking-wide transition-colors'
+        },
+        cache_near_exact: {
+            text: '✨ Near-Exact Cache Hit',
+            classes: 'bg-teal-50 dark:bg-teal-500/10 text-teal-700 dark:text-teal-400 border border-teal-200 dark:border-teal-500/20 rounded-full font-medium tracking-wide transition-colors'
+        },
+        cache_semantic_reuse: {
+            text: '🧠 Reranked Cache Reuse',
+            classes: 'bg-green-50 dark:bg-green-500/10 text-green-700 dark:text-green-400 border border-green-200 dark:border-green-500/20 rounded-full font-medium tracking-wide transition-colors'
+        },
+        cache_partial_reuse: {
+            text: '🧩 Partial Cache Reuse + RAG',
+            classes: 'bg-indigo-50 dark:bg-indigo-500/10 text-indigo-700 dark:text-indigo-400 border border-indigo-200 dark:border-indigo-500/20 rounded-full font-medium tracking-wide transition-colors'
+        },
+        rag_full_research: {
+            text: '🔎 LLM Analysis / Full RAG',
+            classes: 'bg-blue-50 dark:bg-blue-500/10 text-blue-700 dark:text-blue-400 border border-blue-200 dark:border-blue-500/20 rounded-full font-medium tracking-wide transition-colors'
+        }
+    };
+
+    const resolveLabelMeta = (meta = {}) => {
+        let fallbackLabelKey = 'rag_full_research';
+        if (meta.intercepted) {
+            fallbackLabelKey = 'zero_intercept';
+        } else if (meta.cache_match_type === 'exact') {
+            fallbackLabelKey = 'cache_exact';
+        } else if (meta.cache_match_type === 'near_exact') {
+            fallbackLabelKey = 'cache_near_exact';
+        } else if (meta.cache_reuse_mode === 'partial_reuse') {
+            fallbackLabelKey = 'cache_partial_reuse';
+        } else if (meta.cache_reuse_mode === 'full_reuse') {
+            fallbackLabelKey = 'cache_semantic_reuse';
+        }
+        const labelKey = meta.label_key || fallbackLabelKey;
+        return BADGE_CONFIG[labelKey] || BADGE_CONFIG.rag_full_research;
     };
 
     window.copyToClipboard = (text, button) => {
@@ -216,26 +274,24 @@ document.addEventListener('DOMContentLoaded', () => {
     };
 
     // Helper: Create Bot Message Element
-    const appendBotMessage = (text, latency = null, cacheHit = false, intercepted = false) => {
+    const buildBadgeHtml = (meta = {}) => {
+        const latency = meta.latency_ms ?? meta.latency ?? null;
+        if (!latency) return '';
+
+        const labelMeta = resolveLabelMeta(meta);
+        const badgeStyle = '<span class="px-2.5 py-1 ' + labelMeta.classes + '">' + labelMeta.text + '</span>';
+
+        return '<div class="mt-2 flex items-center space-x-2 text-[11px] uppercase">' +
+            badgeStyle +
+            '<span class="text-gray-400 dark:text-gray-500 font-medium tracking-wider">⏱ ' + latency + 'ms</span>' +
+        '</div>';
+    };
+
+    const appendBotMessage = (text, meta = {}) => {
         const msgDiv = document.createElement('div');
         msgDiv.className = 'flex w-full mt-4 space-x-4 max-w-2xl group transition-colors duration-300';
-
-        let badgeHtml = '';
-        if (latency) {
-            let badgeStyle = '';
-            if (cacheHit) {
-                badgeStyle = '<span class="px-2.5 py-1 bg-green-50 dark:bg-green-500/10 text-green-700 dark:text-green-400 border border-green-200 dark:border-green-500/20 rounded-full font-medium tracking-wide transition-colors">⚡ Cache Hit</span>';
-            } else if (intercepted) {
-                badgeStyle = '<span class="px-2.5 py-1 bg-yellow-50 dark:bg-yellow-500/10 text-yellow-700 dark:text-yellow-400 border border-yellow-200 dark:border-yellow-500/20 rounded-full font-medium tracking-wide shadow-sm transition-colors">🛡️ Zero-Layer Intercept</span>';
-            } else {
-                badgeStyle = '<span class="px-2.5 py-1 bg-blue-50 dark:bg-blue-500/10 text-blue-700 dark:text-blue-400 border border-blue-200 dark:border-blue-500/20 rounded-full font-medium tracking-wide transition-colors">🧠 LLM Analysis</span>';
-            }
-
-            badgeHtml = '<div class="mt-2 flex items-center space-x-2 text-[11px] uppercase">' +
-                    badgeStyle +
-                    '<span class="text-gray-400 dark:text-gray-500 font-medium tracking-wider">⏱ ' + latency + 'ms</span>' +
-                '</div>';
-        }
+        const badgeHtml = buildBadgeHtml(meta);
+        const borderStyle = meta.intercepted ? 'border-yellow-200/60 dark:border-yellow-500/30' : 'border-gray-100 dark:border-gray-700';
 
         const safeJsText = escapeHTML(text).replace(/'/g, "\\'").replace(/\n/g, "\\n");
         msgDiv.innerHTML = '<div class="flex-shrink-0 mt-6 h-9 w-9 rounded-full bg-gradient-to-tr from-indigo-500 to-purple-600 flex items-center justify-center shadow-md">' +
@@ -245,13 +301,51 @@ document.addEventListener('DOMContentLoaded', () => {
                 '<div class="flex space-x-2 mb-1 opacity-0 group-hover:opacity-100 transition-opacity text-gray-400 dark:text-gray-500 text-xs">' +
                     '<button class="hover:text-gray-700 dark:hover:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 px-1.5 py-0.5 rounded cursor-pointer transition-colors" onclick="window.copyToClipboard(\'' + safeJsText + '\', this)">📋 复制</button>' +
                 '</div>' +
-                '<div class="bg-white dark:bg-gray-800 p-4 rounded-2xl rounded-tl-sm shadow-sm border ' + (intercepted ? 'border-yellow-200/60 dark:border-yellow-500/30' : 'border-gray-100 dark:border-gray-700') + ' text-gray-800 dark:text-gray-200 text-[15px] whitespace-normal leading-relaxed model-response font-medium transition-colors duration-300 markdown-content overflow-hidden">' +
+                '<div class="bg-white dark:bg-gray-800 p-4 rounded-2xl rounded-tl-sm shadow-sm border ' + borderStyle + ' text-gray-800 dark:text-gray-200 text-[15px] whitespace-normal leading-relaxed model-response font-medium transition-colors duration-300 markdown-content overflow-hidden">' +
                     formatText(text) +
                 '</div>' +
                 badgeHtml +
             '</div>';
         
         chatBox.appendChild(msgDiv);
+        scrollToBottom();
+    };
+
+    const createStreamingBotMessage = () => {
+        const msgDiv = document.createElement('div');
+        msgDiv.className = 'flex w-full mt-4 space-x-4 max-w-2xl group transition-colors duration-300';
+        msgDiv.innerHTML = '<div class="flex-shrink-0 mt-6 h-9 w-9 rounded-full bg-gradient-to-tr from-indigo-500 to-purple-600 flex items-center justify-center shadow-md">' +
+                '<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-5 h-5 text-white"><path stroke-linecap="round" stroke-linejoin="round" d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09l2.846.813-2.846.813a4.5 4.5 0 00-3.09 3.09z" /></svg>' +
+            '</div>' +
+            '<div class="flex flex-col flex-1 mr-8">' +
+                '<div class="flex space-x-2 mb-1 opacity-0 group-hover:opacity-100 transition-opacity text-gray-400 dark:text-gray-500 text-xs streaming-actions"></div>' +
+                '<div class="bg-white dark:bg-gray-800 p-4 rounded-2xl rounded-tl-sm shadow-sm border border-gray-100 dark:border-gray-700 text-gray-800 dark:text-gray-200 text-[15px] whitespace-pre-wrap leading-relaxed model-response font-medium transition-colors duration-300 markdown-content overflow-hidden streaming-body"></div>' +
+                '<div class="streaming-badge"></div>' +
+            '</div>';
+
+        chatBox.appendChild(msgDiv);
+        scrollToBottom();
+        return {
+            root: msgDiv,
+            body: msgDiv.querySelector('.streaming-body'),
+            badge: msgDiv.querySelector('.streaming-badge'),
+            actions: msgDiv.querySelector('.streaming-actions'),
+            rawText: ''
+        };
+    };
+
+    const appendStreamingChunk = (streamMessage, chunk) => {
+        streamMessage.rawText += chunk;
+        streamMessage.body.textContent = streamMessage.rawText;
+        scrollToBottom();
+    };
+
+    const finalizeStreamingBotMessage = (streamMessage, meta) => {
+        const finalText = streamMessage.rawText || meta.answer || '';
+        const safeJsText = escapeHTML(finalText).replace(/'/g, "\\'").replace(/\n/g, "\\n");
+        streamMessage.body.innerHTML = formatText(finalText);
+        streamMessage.actions.innerHTML = '<button class="hover:text-gray-700 dark:hover:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 px-1.5 py-0.5 rounded cursor-pointer transition-colors" onclick="window.copyToClipboard(\'' + safeJsText + '\', this)">📋 复制</button>';
+        streamMessage.badge.innerHTML = buildBadgeHtml(meta);
         scrollToBottom();
     };
 
@@ -301,7 +395,7 @@ document.addEventListener('DOMContentLoaded', () => {
                       <path d="M12 2L14.6 9.4L22 12L14.6 14.6L12 22L9.4 14.6L2 12L9.4 9.4L12 2Z" />
                     </svg>
                     <span class="text-[15px] font-medium tracking-wide animate-pulse bg-clip-text text-transparent bg-gradient-to-r from-indigo-500 to-purple-600 dark:from-indigo-400 dark:to-purple-500">
-                        Thinking...
+                        <span class="loader-text">Thinking...</span>
                     </span>
                 </div>
             </div>
@@ -316,9 +410,19 @@ document.addEventListener('DOMContentLoaded', () => {
         if (el) el.remove();
     };
 
+    const updateLoadingIndicator = (id, text) => {
+        const el = document.getElementById(id);
+        if (!el) return;
+        const textEl = el.querySelector('.loader-text');
+        if (textEl) {
+            textEl.textContent = text;
+        }
+    };
+
     // Retry global binding
     window.lastAttemptedQuery = "";
     window.retryLastRequest = (btnElement) => {
+        if (isRequestLocked) return;
         if(window.lastAttemptedQuery) {
             if (btnElement) {
                 const errorBox = btnElement.closest('.flex.w-full.mt-4');
@@ -357,7 +461,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const query = typeof overrideText === 'string' ? overrideText : userInput.value.trim();
         const accessCode = finalAccessKey || accessCodeInput.value.trim();
 
-        if (!query) return;
+        if (!query || isRequestLocked) return;
 
         if (!accessCode) {
             alert('🔒 请先在右上角输入专属【邀请码】并点击【保存】！\n💡 您可以在我的简历中找到它。');
@@ -365,30 +469,32 @@ document.addEventListener('DOMContentLoaded', () => {
             return;
         }
 
-        window.lastAttemptedQuery = query; // Save for retry even when backend is not ready yet
-
-        const readiness = await ensureBackendReady();
-        if (!readiness.ok) {
-            appendErrorMessage(readiness.message, query);
-            return;
-        }
-
-        // Add user msg if not retrying
-        if(!isRetry) {
-             appendUserMessage(query);
-        }
-        
-        if (typeof overrideText !== 'string') {
-            userInput.value = '';
-        }
-        
-        // Show loader
-        const loaderId = createLoadingIndicator();
-        sendBtn.disabled = true;
+        let loaderId = null;
+        setRequestLocked(true);
 
         try {
+            window.lastAttemptedQuery = query; // Save for retry even when backend is not ready yet
+
+            const readiness = await ensureBackendReady();
+            if (!readiness.ok) {
+                appendErrorMessage(readiness.message, query);
+                return;
+            }
+
+            // Add user msg if not retrying
+            if(!isRetry) {
+                 appendUserMessage(query);
+            }
+            
+            if (typeof overrideText !== 'string') {
+                userInput.value = '';
+            }
+            
+            // Show loader
+            loaderId = createLoadingIndicator();
+
             // Request backend
-            const response = await fetch(API_URL, {
+            const response = await fetch(CHAT_API_URL, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
@@ -412,17 +518,68 @@ document.addEventListener('DOMContentLoaded', () => {
                 throw new Error(errData.detail || 'The API request failed.');
             }
 
-            const data = await response.json();
+            if (!response.body) {
+                throw new Error('Streaming response body is unavailable.');
+            }
+
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
+            let streamMessage = null;
+
+            while (true) {
+                const { value, done } = await reader.read();
+                if (done) break;
+
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split('\n');
+                buffer = lines.pop() || '';
+
+                for (const line of lines) {
+                    if (!line.trim()) continue;
+                    const event = JSON.parse(line);
+
+                    if (event.type === 'status') {
+                        updateLoadingIndicator(loaderId, event.message || 'Thinking...');
+                        continue;
+                    }
+
+                    if (event.type === 'token') {
+                        if (!streamMessage) {
+                            removeLoadingIndicator(loaderId);
+                            streamMessage = createStreamingBotMessage();
+                        }
+                        appendStreamingChunk(streamMessage, event.content || '');
+                        continue;
+                    }
+
+                    if (event.type === 'final') {
+                        if (!streamMessage) {
+                            removeLoadingIndicator(loaderId);
+                            streamMessage = createStreamingBotMessage();
+                            if (event.answer) {
+                                appendStreamingChunk(streamMessage, event.answer);
+                            }
+                        } else if (!streamMessage.rawText && event.answer) {
+                            appendStreamingChunk(streamMessage, event.answer);
+                        }
+                        finalizeStreamingBotMessage(streamMessage, event);
+                        continue;
+                    }
+
+                    if (event.type === 'error') {
+                        throw new Error(event.message || 'The API request failed.');
+                    }
+                }
+            }
+
             removeLoadingIndicator(loaderId);
-            
-            // Build response
-            appendBotMessage(data.answer, data.latency_ms, data.cache_hit, data.intercepted);
             
             // Clear last attempt on success
             window.lastAttemptedQuery = "";
 
         } catch (error) {
-            removeLoadingIndicator(loaderId);
+            if (loaderId) removeLoadingIndicator(loaderId);
             // Render specific retry UI
             if(error.message === 'Failed to fetch') {
                  appendErrorMessage("网络请求失败，后端服务可能未启动或网络异常。", query);
@@ -430,7 +587,8 @@ document.addEventListener('DOMContentLoaded', () => {
                  appendErrorMessage(error.message, query);
             }
         } finally {
-            sendBtn.disabled = false;
+            if (loaderId) removeLoadingIndicator(loaderId);
+            setRequestLocked(false);
             userInput.focus();
         }
     };
@@ -438,6 +596,6 @@ document.addEventListener('DOMContentLoaded', () => {
     // Listeners
     sendBtn.addEventListener('click', () => handleSend());
     userInput.addEventListener('keypress', (e) => {
-        if (e.key === 'Enter') handleSend();
+        if (e.key === 'Enter' && !isRequestLocked) handleSend();
     });
 });

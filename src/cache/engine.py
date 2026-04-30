@@ -1,11 +1,11 @@
 from typing import Dict, List, Optional
 import redis
-import difflib
+import unicodedata
 from pydantic import BaseModel
 from redisvl.extensions.cache.embeddings import EmbeddingsCache
 from redisvl.extensions.cache.llm import SemanticCache
 from redisvl.utils.vectorize import HFTextVectorizer
-from common.env import REDIS_URL, CACHE_NAME, CACHE_DISTANCE_THRESHOLD
+from common.env import REDIS_URL, CACHE_NAME, CACHE_DISTANCE_THRESHOLD, CACHE_L1_EXACT_ENABLED
 
 class CacheResult(BaseModel):
     prompt: str
@@ -13,6 +13,7 @@ class CacheResult(BaseModel):
     vector_distance: float
     cosine_similarity: float
     seed_id: Optional[int] = None
+    match_type: str = "semantic"
 
 class CacheResults(BaseModel):
     query: str
@@ -57,6 +58,69 @@ class SemanticCacheWrapper:
         )
         self._seed_id_by_question: Dict[str, int] = {}
         self._answer_by_question: Dict[str, str] = {}
+        self._normalized_question_map: Dict[str, str] = {}
+        self._near_exact_question_map: Dict[str, str] = {}
+
+    @staticmethod
+    def normalize_query(query: str) -> str:
+        """归一化 query，用于 exact fast path。"""
+        return " ".join(str(query).strip().lower().split())
+
+    @staticmethod
+    def normalize_surface_query(query: str) -> str:
+        """更激进的表面归一化，仅用于 near_exact fast path。"""
+        normalized = unicodedata.normalize("NFKC", str(query)).lower().strip()
+        collapsed = "".join(normalized.split())
+        allowed_chars = []
+        for char in collapsed:
+            if unicodedata.category(char).startswith("P"):
+                continue
+            allowed_chars.append(char)
+        return "".join(allowed_chars)
+
+    @staticmethod
+    def split_query_segments(query: str) -> List[str]:
+        """按常见分句符与连接词拆分复合问题，供子问题候选扫描使用。"""
+        normalized = unicodedata.normalize("NFKC", str(query))
+        for separator in ["？", "?", "！", "!", "。", "；", ";", "，", ",", "另外", "还有", "以及", "并且"]:
+            normalized = normalized.replace(separator, "\n")
+        segments = []
+        for segment in normalized.splitlines():
+            cleaned = segment.strip()
+            if len(cleaned) >= 4:
+                segments.append(cleaned)
+        return segments
+
+    def find_subquery_candidate(self, query: str) -> Optional[CacheResult]:
+        """在复合问题中扫描已缓存子问题，命中后返回 rerank 候选。"""
+        for segment in self.split_query_segments(query):
+            normalized_segment = self.normalize_query(segment)
+            exact_match = self._normalized_question_map.get(normalized_segment)
+            if exact_match:
+                print(f"⚡ [子问题命中] exact subquery hit: '{segment}' -> '{exact_match}'")
+                return CacheResult(
+                    prompt=exact_match,
+                    response=self._answer_by_question[exact_match],
+                    vector_distance=0.0,
+                    cosine_similarity=1.0,
+                    seed_id=self._seed_id_by_question.get(exact_match),
+                    match_type="subquery_exact",
+                )
+
+            near_exact_segment = self.normalize_surface_query(segment)
+            near_exact_match = self._near_exact_question_map.get(near_exact_segment)
+            if near_exact_match:
+                print(f"⚡ [子问题命中] near-exact subquery hit: '{segment}' -> '{near_exact_match}'")
+                return CacheResult(
+                    prompt=near_exact_match,
+                    response=self._answer_by_question[near_exact_match],
+                    vector_distance=0.0,
+                    cosine_similarity=1.0,
+                    seed_id=self._seed_id_by_question.get(near_exact_match),
+                    match_type="subquery_near_exact",
+                )
+
+        return None
 
     def clear(self):
         """物理清空整个向量索引和相关数据"""
@@ -76,6 +140,8 @@ class SemanticCacheWrapper:
         self.embeddings_cache.clear()
         self._seed_id_by_question = {}
         self._answer_by_question = {}
+        self._normalized_question_map = {}
+        self._near_exact_question_map = {}
 
     def store_batch(self, qa_pairs: List[Dict], clear: bool = True):
         """
@@ -92,23 +158,45 @@ class SemanticCacheWrapper:
             self.cache.store(prompt=q, response=a)
             self._seed_id_by_question[str(q)] = seed_id
             self._answer_by_question[str(q)] = a
+            self._normalized_question_map[self.normalize_query(q)] = str(q)
+            self._near_exact_question_map[self.normalize_surface_query(q)] = str(q)
 
     def check(self, query: str, distance_threshold: Optional[float] = None, num_results: int = 1) -> CacheResults:
-        # ===== 前置短路拦截：基于 difflib 的字符串精确/模糊匹配 =====
-        fuzzy_matches = difflib.get_close_matches(query, self._seed_id_by_question.keys(), n=1, cutoff=0.85)
-        if fuzzy_matches:
-            matched_q = fuzzy_matches[0]
-            print(f"⚡ [短路拦截] difflib 模糊命中: '{query}' -> '{matched_q}'")
-            return CacheResults(query=query, matches=[
-                CacheResult(
-                    prompt=matched_q,
-                    response=self._answer_by_question[matched_q],
-                    vector_distance=0.0,
-                    cosine_similarity=1.0,
-                    seed_id=self._seed_id_by_question.get(matched_q)
-                )
-            ])
-        # =========================================================
+        # ===== L1 exact fast path：归一化后完全一致则直接命中 =====
+        if CACHE_L1_EXACT_ENABLED:
+            normalized_query = self.normalize_query(query)
+            exact_match = self._normalized_question_map.get(normalized_query)
+            if exact_match:
+                print(f"⚡ [精确命中] normalized exact hit: '{query}' -> '{exact_match}'")
+                return CacheResults(query=query, matches=[
+                    CacheResult(
+                        prompt=exact_match,
+                        response=self._answer_by_question[exact_match],
+                        vector_distance=0.0,
+                        cosine_similarity=1.0,
+                        seed_id=self._seed_id_by_question.get(exact_match),
+                        match_type="exact",
+                    )
+                ])
+
+            near_exact_query = self.normalize_surface_query(query)
+            near_exact_match = self._near_exact_question_map.get(near_exact_query)
+            if near_exact_match:
+                print(f"⚡ [近精确命中] normalized surface hit: '{query}' -> '{near_exact_match}'")
+                return CacheResults(query=query, matches=[
+                    CacheResult(
+                        prompt=near_exact_match,
+                        response=self._answer_by_question[near_exact_match],
+                        vector_distance=0.0,
+                        cosine_similarity=1.0,
+                        seed_id=self._seed_id_by_question.get(near_exact_match),
+                        match_type="near_exact",
+                    )
+                ])
+
+            subquery_candidate = self.find_subquery_candidate(query)
+            if subquery_candidate:
+                return CacheResults(query=query, matches=[subquery_candidate])
         
         candidates = self.cache.check(query, distance_threshold=distance_threshold, num_results=num_results)
         
@@ -122,6 +210,7 @@ class SemanticCacheWrapper:
             result["cosine_similarity"] = float((2 - result["vector_distance"]) / 2)
             result["query"] = query
             result["seed_id"] = self._seed_id_by_question.get(str(result.get("prompt", "")))
+            result["match_type"] = "semantic"
             results.append(CacheResult(**result))
             
         return CacheResults(query=query, matches=results)

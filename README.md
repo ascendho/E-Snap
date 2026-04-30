@@ -8,10 +8,97 @@
 
 ## 🌟 核心特性
 
+- **两级缓存链路 (Two-Layer Cache Path):** 当前代码已经拆成 L1 `exact + near_exact fast path` + L2 `semantic cache`。L1 负责规则归一化后的快速命中并直接跳过 reranker，L2 负责语义候选召回与复用裁判。
 - **语义缓存 (Semantic Caching):** 利用 RedisVL 和专用的嵌入模型 (`ep-m-2026...`) 对语义相似的问题进行缓存和快速返回，大幅降低 Token 消耗和响应延迟。
-- **工作流编排 (Workflow Orchestration):** 基于 LangGraph 驱动，Agent 在回复用户前能够进行复杂的推理、迭代反思以及多步检索研究。
+- **工作流编排 (Workflow Orchestration):** 基于 LangGraph 驱动，Agent 在回复用户前会先经过零层拦截、缓存分流、三态 reranker，再进入补充研究或完整 RAG。
 - **全栈集成 (Full-Stack Integration):** FastAPI 一体化地提供复杂的后端 AI 逻辑服务和现代化的毛玻璃风格前端页面。无需处理跨域（CORS）烦恼，大大降低部署复杂度。
-- **高品质用户体验:** 进阶版 UI 支持暗黑/明亮模式智能切换，拥有实时的发光 "Thinking" 思考状态提示，以及精美的组件。
+- **高品质用户体验:** 进阶版 UI 支持暗黑/明亮模式智能切换，拥有实时的发光 "Thinking" 思考状态提示，以及流式输出的应答体验。
+
+## 缓存匹配机制
+
+当前代码里的“模糊匹配”不是传统编辑距离算法，也不是 `difflib`。实际实现位于 [src/cache/engine.py](src/cache/engine.py)，由四层候选链路组成：
+
+1. `exact`
+    - 使用 `normalize_query()`：统一小写、裁剪首尾空格、折叠连续空白。
+    - 适合完全同问或仅有普通空白差异的问题。
+2. `near_exact`
+    - 使用 `normalize_surface_query()`：在 `exact` 的基础上继续做 Unicode `NFKC` 归一化、去空格、去标点。
+    - 适合“只差标点/全半角/格式噪声”的重复提问。
+3. `subquery_exact / subquery_near_exact`
+  - 当整句没有命中 `exact/near_exact` 时，会把复合问题按问号、逗号、句号以及 `另外/还有/以及/并且` 等连接词做轻量分句。
+  - 如果其中某个子问题命中了历史缓存，会把它当作 reranker 候选，而不是直接整句直出。
+  - 适合“前半句问过、后半句是新增问题”的复合提问。
+4. `semantic`
+    - 使用 RedisVL 向量检索做语义召回。
+    - 命中后不会直接复用，而是进入 LLM reranker 进一步判断。
+
+这意味着：
+- 第一次经 RAG 回答过的问题，在写回缓存后再次原样提问，通常会变成 `exact` 或 `near_exact` 命中。
+- 复合问题如果只部分覆盖缓存内容，不会被粗暴当成完整缓存命中，而是进入 `partial_reuse` 路径。
+
+## 详细工作流
+
+当前真实工作流如下，对应代码主要位于 [src/workflow/nodes.py](src/workflow/nodes.py)、[src/workflow/edges.py](src/workflow/edges.py)、[src/workflow/graph.py](src/workflow/graph.py)：
+
+1. `pre_check_node`
+    - 做“第零层拦截”。
+    - 识别时间敏感问题、库存问题、特定商品型号问题。
+    - 命中后直接返回固定回复，不进入缓存或 RAG。
+
+2. `check_cache_node`
+  - 先按 `exact -> near_exact -> subquery -> semantic` 的顺序找缓存候选。
+    - `exact/near_exact` 命中会直接保留答案并进入快速直出。
+  - `subquery/semantic` 命中只代表“找到了可供裁判的候选”，还不能直接复用答案。
+
+3. `cache_router`
+  - `exact` 或 `near_exact`：直接进入 `synthesize_response`。
+  - `subquery_exact / subquery_near_exact / semantic`：进入 `rerank_cache_node`。
+    - `none`：直接进入 `research_node`。
+
+4. `rerank_cache_node`
+    - 使用 `ANALYSIS_MODEL_NAME` 做三态判断：
+      - `full_reuse`
+      - `partial_reuse`
+      - `reject`
+    - `full_reuse` 表示缓存答案已经完整覆盖当前问题。
+    - `partial_reuse` 表示缓存答案只覆盖了一部分，并会额外产出 `residual_query`。
+    - `reject` 表示缓存答案不能安全复用，回退到完整研究。
+
+5. `cache_rerank_router`
+    - `full_reuse`：直接进入 `synthesize_response`。
+    - `partial_reuse`：进入 `research_supplement_node`，只研究缺口问题。
+    - `reject`：进入 `research_node`，走完整 RAG。
+
+6. `research_node`
+    - 使用 `RESEARCH_MODEL_NAME` 驱动工具调用。
+    - 当前是单轮 RAG，但允许一次回答内部最多多次工具交互。
+    - 工具为 `search_knowledge_base`。
+
+7. `research_supplement_node`
+    - 只围绕 `residual_query` 做补充研究。
+    - 然后把“缓存已覆盖答案”和“新补充的信息”合并成最终回复。
+
+8. `synthesize_response_node`
+    - 统一输出最终答案。
+    - 如果本次答案来自 research 或 supplement research，会把当前完整问答写回缓存。
+    - 因此一个第一次通过 RAG 回答的问题，下一次再问时很可能就会变成 `exact` 或 `near_exact`。
+
+## 响应标签含义
+
+当前前端标签与后端 `label_key` 一一对应：
+
+- `Zero-Layer Intercept`
+  - 命中了 `pre_check_node` 的零层拦截。
+- `Exact Cache Hit`
+  - 命中了 `exact` 缓存直出。
+- `Near-Exact Cache Hit`
+  - 命中了 `near_exact` 缓存直出。
+- `Reranked Cache Reuse`
+  - 命中了非快速直出候选（例如 `semantic` 或 `subquery_*`），并被 reranker 判定为 `full_reuse`。
+- `Partial Cache Reuse + RAG`
+  - 命中了 `semantic` 或 `subquery_*` 候选，并被 reranker 判定为 `partial_reuse`，随后又做了补充研究。
+- `LLM Analysis / Full RAG`
+  - 未命中缓存，或缓存候选被 reranker `reject`，最终走完整 RAG。
 
 ## 📂 架构与目录结构
 有别于常规的玩具项目，本代码库拥抱领域驱动设计（DDD）。我们不是简单地将代码分为 `frontend` 和 `backend`，**`src/` 目录正是整个应用的大脑核心。**
@@ -24,7 +111,7 @@
 └── src/                  # 核心后端逻辑 (Python)
     ├── api/              # 网关与路由 (FastAPI 服务器、路由挂载)
     ├── workflow/         # 智能工作流 (LangGraph Node、Edge、状态和提示词)
-    ├── cache/            # 缓存与性能 (RedisVL 语义缓存集成)
+    ├── cache/            # 缓存与性能 (当前为 L1 exact + L2 RedisVL semantic)
     ├── knowledge/        # 知识库层 (文档解析机制、Embedding 嵌入)
     └── common/           # 基础设施层 (日志配置、环境变量安全)
 ```
@@ -49,7 +136,11 @@ source .venv/bin/activate
 ```bash
 cp .env.example .env
 ```
-说明：应用启动时会自动读取根目录下的 `.env`，不需要手动 `source .env`。其中 `ARK_API_KEY` 必填；`REDIS_URL` 默认是 `redis://localhost:6379`，只有在 Redis 不跑本机默认端口时才需要改。
+说明：应用启动时会自动读取根目录下的 `.env`，不需要手动 `source .env`。其中 `ARK_API_KEY` 必填；`REDIS_URL` 默认是 `redis://localhost:6379`，只有在 Redis 不跑本机默认端口时才需要改。当前代码把缓存配置拆成了 `CACHE_L1_EXACT_ENABLED` 与 `CACHE_L2_DISTANCE_THRESHOLD` 两层，便于后续把向量层迁移到 Qdrant、而把 Redis 专注在 L2 响应缓存与限流。
+
+### 当前存储建议
+- 当前最小可运行实现：L1 为 exact fast path，L2 与 RAG 向量都暂时仍由 Redis/RedisVL 承载。
+- 推荐的下一步物理形态：向量相关统一迁移到 Qdrant（缓存向量集合 + RAG 文档集合），Redis 保留给 L2 响应缓存、精确键索引、限流与轻量元数据。
 
 `.env.example` 的作用：
 - 作为新机器/新同学首次启动时的配置模板
