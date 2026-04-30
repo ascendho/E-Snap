@@ -54,12 +54,12 @@ def main():
     workflow_app = create_agent_graph(cache, kb_index, embeddings)
 
     # ---------------------------------------------------------
-    # 步骤 4) 运行场景化测试
+    # 步骤 4) 运行离线测试集
     # ---------------------------------------------------------
     # 从环境变量读取配置：是否在控制台打印详细的 JSON 运行结果（默认不打印）
     show_console_results = to_bool_env("SHOW_CONSOLE_RESULTS", False)
     
-    # 执行预设的测试场景：
+    # 执行预设的测试集：
     run_workflow_scenarios(
         workflow_app=workflow_app,
         logger=logger,

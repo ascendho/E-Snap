@@ -159,7 +159,28 @@ export PYTHONPATH=$(pwd)/src:$PYTHONPATH
 打开浏览器访问 **[http://127.0.0.1:8000](http://127.0.0.1:8000)** 即可开始与您的智能客服智能体对话！
 
 ### 6. 运行测试
+#### 运行默认测试集（`data/test_scenarios.json`）
+```bash
 PYTHONPATH=. .venv/bin/python src/main.py
+```
+
+#### 运行完整测试集（`data/test_scenarios_full.json`）
+```bash
+TEST_SCENARIO_PROFILE=full PYTHONPATH=. .venv/bin/python src/main.py
+```
+
+#### 运行完整测试集并打印控制台结果
+```bash
+TEST_SCENARIO_PROFILE=full SHOW_CONSOLE_RESULTS=true PYTHONPATH=. .venv/bin/python src/main.py
+```
+
+运行结果会覆盖写入 `outputs/run_summary.csv`（测试明细）和 `outputs/performance_report.txt`（聚合性能报表）。
+
+当前 `performance_report.txt` 已接入真实 token 与人民币成本指标：
+- `ANALYSIS_MODEL_NAME` 按 Doubao-Seed-2.0-lite 基础模型低档价格计费：输入 `0.0006` 元/千tokens，输出 `0.0036` 元/千tokens，缓存命中输入 `0.00012` 元/千tokens。
+- `RESEARCH_MODEL_NAME` 按 DeepSeek-V3.2 基础模型价格计费：输入 `0.0020` 元/千tokens，输出 `0.0030` 元/千tokens，缓存命中输入 `0.00040` 元/千tokens。
+- 仅统计 API 实际返回的 usage metadata；本地 Redis 语义缓存命中不额外计厂商 token 费用，prompt cache storage 费用当前按 `0` 处理。
+- 离线测试链路会等待后台子问题缓存线程完成，因此报表中的 token / RMB 成本比在线单次响应日志更完整。
 
 ---
 

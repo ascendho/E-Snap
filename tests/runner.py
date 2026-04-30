@@ -1,6 +1,6 @@
 from typing import Dict, Any
 def run_agent(workflow_app, query: str) -> Dict[str, Any]:
-    from workflow.nodes import build_initial_state
+    from workflow.nodes import build_initial_state, wait_for_background_tasks
     import time
     
     start_time = time.perf_counter()
@@ -8,6 +8,8 @@ def run_agent(workflow_app, query: str) -> Dict[str, Any]:
     
     final_state = workflow_app.invoke(initial_state)
     total_time = (time.perf_counter() - start_time) * 1000
+    if isinstance(final_state, dict):
+        final_state = wait_for_background_tasks(final_state)
     if isinstance(final_state, dict) and "metrics" in final_state:
         final_state["metrics"]["total_latency"] = total_time
         
@@ -16,6 +18,7 @@ def run_agent(workflow_app, query: str) -> Dict[str, Any]:
 def display_results(result: Dict[str, Any]) -> None:
     query = result.get("query", "")
     metrics = result.get("metrics", {})
+    llm_usage = result.get("llm_usage", {})
     cache_hit = result.get("cache_hit", False)
     cache_conf = result.get("cache_confidence", 0.0)
     cache_match_type = result.get("cache_match_type", "none")
@@ -36,6 +39,7 @@ def display_results(result: Dict[str, Any]) -> None:
     print("-" * 60)
     print("📈 性能指标:")
     print(f"  • 词频总耗时: {metrics.get('total_latency', 0):.0f}ms")
+    print(f"  • 真实 Token 成本: ￥{float(llm_usage.get('total_cost_rmb', 0) or 0):.6f}")
     print(f"  • 节点执行路径: {' -> '.join(result.get('execution_path', []))}")
     if cache_written_prompts:
         print(f"  • 本轮写回缓存: {' | '.join(cache_written_prompts)}")
@@ -79,6 +83,7 @@ def analyze_agent_results(results: list) -> tuple:
                 "path_type": classify_result_path(res),
                 "latency": metrics.get("total_latency", 0),
                 "total_llm_calls": sum(res.get("llm_calls", {}).values()),
+                "total_cost_rmb": float(res.get("llm_usage", {}).get("total_cost_rmb", 0) or 0),
             }
             analysis_data.append(row)
 
@@ -92,7 +97,7 @@ partial_reuse 数: {partial_reuse_count}
 直接缓存命中率: {(direct_cache_hits/total_queries)*100 if total_queries > 0 else 0:.1f}%
 
 性能对比 (按路径分组的平均指标):
-{df.groupby('path_type')[['latency', 'total_llm_calls']].mean().round(2).to_string()}
+{df.groupby('path_type')[['latency', 'total_llm_calls', 'total_cost_rmb']].mean().round(6).to_string()}
 =========================================
 """
             logger.info(summary_text)
@@ -125,7 +130,7 @@ def run_workflow_scenarios(
     start_time = time.perf_counter()
     all_results = []
     for scenario in SCENARIO_RUNS:
-        logger.info("运行场景：%s", scenario["title"])
+        logger.info("运行测试项：%s", scenario["title"])
         result = run_agent(workflow_app, scenario["query"])
         all_results.append(result)
         if show_console_results:
@@ -133,7 +138,7 @@ def run_workflow_scenarios(
 
     total_wall_time = time.perf_counter() - start_time
     export_paths = export_results(all_results, total_wall_time)
-    logger.info("结果已导出 | 场景明细=%s", export_paths["summary_csv"])
+    logger.info("结果已导出 | 测试明细=%s", export_paths["summary_csv"])
     logger.info("结果已导出 | 宏观性能=%s", export_paths["perf_metrics_txt"])
 
     logger.info("分析 Agent 性能...")

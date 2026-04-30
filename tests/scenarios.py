@@ -16,16 +16,33 @@ except FileNotFoundError:
 
 SCENARIO_RUNS = []
 
-# 动态构建所有的测试场景
-def _load_scenario(key_name, title_prefix):
-    queries = _test_data.get(key_name, [])
-    for i, q in enumerate(queries, 1):
-        SCENARIO_RUNS.append({"title": f"{title_prefix}-问题{i}", "query": q})
+def _normalize_query_item(item):
+    if isinstance(item, str):
+        return item.strip()
+    if isinstance(item, dict):
+        query = item.get("query", "")
+        if isinstance(query, str):
+            return query.strip()
+    return ""
 
-_load_scenario("SCENARIO_1_QUERIES", "场景1")
-_load_scenario("SCENARIO_2_QUERIES", "场景2")
-_load_scenario("SCENARIO_3_QUERIES", "场景3")
-_load_scenario("SCENARIO_4_FUZZY_QUERIES", "场景4(模糊测试)")
-_load_scenario("SCENARIO_5_INTERCEPT_QUERIES", "场景5(拦截测试)")
-_load_scenario("SCENARIO_6_PARTIAL_REUSE_SUCCESS_QUERIES", "场景6(部分复用成功)")
-_load_scenario("SCENARIO_7_PARTIAL_REUSE_REJECT_QUERIES", "场景7(部分复用拒绝)")
+
+def _iter_queries(data):
+    if isinstance(data, list):
+        for item in data:
+            query = _normalize_query_item(item)
+            if query:
+                yield query
+        return
+
+    if isinstance(data, dict):
+        for queries in data.values():
+            if not isinstance(queries, list):
+                continue
+            for item in queries:
+                query = _normalize_query_item(item)
+                if query:
+                    yield query
+
+
+for index, query in enumerate(_iter_queries(_test_data), 1):
+    SCENARIO_RUNS.append({"title": f"测试{index:02d}", "query": query})
