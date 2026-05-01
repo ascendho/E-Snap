@@ -7,9 +7,9 @@ def run_agent(workflow_app, query: str) -> Dict[str, Any]:
     initial_state = build_initial_state(query)
     
     final_state = workflow_app.invoke(initial_state)
-    total_time = (time.perf_counter() - start_time) * 1000
     if isinstance(final_state, dict):
         final_state = wait_for_background_tasks(final_state)
+    total_time = (time.perf_counter() - start_time) * 1000
     if isinstance(final_state, dict) and "metrics" in final_state:
         final_state["metrics"]["total_latency"] = total_time
         

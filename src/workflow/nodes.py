@@ -72,6 +72,7 @@ def get_research_llm():
         _research_llm = ChatOpenAI(
             model=RESEARCH_MODEL_NAME,
             temperature=0.2,                                     # 设置适度的创造性
+            stream_usage=True,                                   # 流式接口也返回 usage metadata，便于统一统计 token / 成本
             max_tokens=400,                                      # 限制输出长度
             api_key=os.getenv("ARK_API_KEY"),                    # 共享 API 密钥
             base_url=ARK_BASE_URL

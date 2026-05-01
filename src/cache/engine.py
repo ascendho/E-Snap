@@ -94,7 +94,7 @@ class SemanticCacheWrapper:
         segments = []
         for segment in normalized.splitlines():
             cleaned = segment.strip()
-            if len(cleaned) >= 4:
+            if len(cleaned) >= 2:
                 segments.append(cleaned)
         return segments
 

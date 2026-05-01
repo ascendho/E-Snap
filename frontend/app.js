@@ -235,6 +235,10 @@ document.addEventListener('DOMContentLoaded', () => {
             text: '🧠 Reranked Cache Reuse',
             classes: 'bg-green-50 dark:bg-green-500/10 text-green-700 dark:text-green-400 border border-green-200 dark:border-green-500/20 rounded-full font-medium tracking-wide transition-colors'
         },
+        cache_dual_subquery: {
+            text: '🔀 Dual Subquery Cache Hit',
+            classes: 'bg-orange-50 dark:bg-orange-500/10 text-orange-700 dark:text-orange-300 border border-orange-200 dark:border-orange-500/20 rounded-full font-medium tracking-wide transition-colors'
+        },
         cache_partial_reuse: {
             text: '🧩 Partial Cache Reuse + RAG',
             classes: 'bg-indigo-50 dark:bg-indigo-500/10 text-indigo-700 dark:text-indigo-400 border border-indigo-200 dark:border-indigo-500/20 rounded-full font-medium tracking-wide transition-colors'
@@ -255,6 +259,8 @@ document.addEventListener('DOMContentLoaded', () => {
             fallbackLabelKey = 'cache_near_exact';
         } else if (meta.cache_match_type === 'edit_distance') {
             fallbackLabelKey = 'cache_edit_distance';
+        } else if (meta.cache_reuse_mode === 'dual_subquery') {
+            fallbackLabelKey = 'cache_dual_subquery';
         } else if (meta.cache_reuse_mode === 'partial_reuse') {
             fallbackLabelKey = 'cache_partial_reuse';
         } else if (meta.cache_reuse_mode === 'full_reuse') {

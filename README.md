@@ -26,6 +26,7 @@
     - 适合“只差标点/全半角/格式噪声”的重复提问。
 3. `subquery_exact / subquery_near_exact`
   - 当整句没有命中 `exact/near_exact` 时，会把复合问题按问号、逗号、句号以及 `另外/还有/以及/并且` 等连接词做轻量分句。
+  - 当前复合问题分句的最小段长已经统一为 `2` 个字符，避免缓存层与工作流层对短子问题处理不一致。
   - 如果其中某个子问题命中了历史缓存，会把它当作 reranker 候选，而不是直接整句直出。
   - 适合“前半句问过、后半句是新增问题”的复合提问。
 4. `semantic`
@@ -35,6 +36,8 @@
 这意味着：
 - 第一次经 RAG 回答过的问题，在写回缓存后再次原样提问，通常会变成 `exact` 或 `near_exact` 命中。
 - 复合问题如果只部分覆盖缓存内容，不会被粗暴当成完整缓存命中，而是进入 `partial_reuse` 路径。
+- 当复合问题的两个子问题都已经在 L1 缓存中时，第二次 `A+B` 或 `B+A` 往往会走 `dual_subquery` 快速路径：跳过 RAG，也跳过合并 LLM，直接复用两段缓存答案。
+- 在 `dual_subquery` 路径下，系统会把当前整句复合问法写回缓存，因此后续再次原样提问时，通常会进一步变成 `exact` 或 `near_exact` 命中。
 
 ## 详细工作流
 
@@ -76,12 +79,14 @@
 
 7. `research_supplement_node`
     - 只围绕 `residual_query` 做补充研究。
-    - 然后把“缓存已覆盖答案”和“新补充的信息”合并成最终回复。
+  - 如果缺口问题本身也已经在 L1 缓存中，会直接走 B1 短路，跳过 RAG，并在当前实现中连合并 LLM 也一并跳过。
+  - 然后把“缓存已覆盖答案”和“新补充的信息”合并成最终回复。
 
 8. `synthesize_response_node`
     - 统一输出最终答案。
-    - 如果本次答案来自 research 或 supplement research，会把当前完整问答写回缓存。
-    - 因此一个第一次通过 RAG 回答的问题，下一次再问时很可能就会变成 `exact` 或 `near_exact`。
+  - 如果本次答案来自 research 或 supplement research，会把当前完整问答或子问题问答写回缓存。
+  - 对普通复合问题，系统优先写回子问题答案，避免把未稳定的整句合并结果过早写入缓存。
+  - 对 `dual_subquery` 路径，系统会把当前整句复合问法也写回缓存，因此常见表现是：第一次复合提问补齐缺口，第二次 `A+B/B+A` 快速复用，第三次相同整句直接命中。
 
 ## 响应标签含义
 
@@ -95,6 +100,9 @@
   - 命中了 `near_exact` 缓存直出。
 - `Reranked Cache Reuse`
   - 命中了非快速直出候选（例如 `semantic` 或 `subquery_*`），并被 reranker 判定为 `full_reuse`。
+- `Dual Subquery Cache Hit`
+  - 复合问题的两个子问题都已经命中 L1 缓存。
+  - 会跳过 RAG，也跳过合并 LLM，直接由两段缓存答案拼出最终回复。
 - `Partial Cache Reuse + RAG`
   - 命中了 `semantic` 或 `subquery_*` 候选，并被 reranker 判定为 `partial_reuse`，随后又做了补充研究。
 - `LLM Analysis / Full RAG`
@@ -208,6 +216,8 @@ PYTHONPATH=. .venv/bin/python -m unittest discover -s tests/unit -v
 - `RESEARCH_MODEL_NAME` 按 DeepSeek-V3.2 基础模型价格计费：输入 `0.0020` 元/千tokens，输出 `0.0030` 元/千tokens，缓存命中输入 `0.00040` 元/千tokens。
 - 仅统计 API 实际返回的 usage metadata；本地 Redis 语义缓存命中不额外计厂商 token 费用，prompt cache storage 费用当前按 `0` 处理。
 - 离线测试链路会等待后台子问题缓存线程完成，因此报表中的 token / RMB 成本比在线单次响应日志更完整。
+- 报表中的 `full_reuse` 节省量同时覆盖两类路径：`cache_hit=True` 的直接缓存直出，以及 `cache_reuse_mode == "full_reuse"` 的 reranker 完整复用。
+- 无缓存 baseline 优先使用完整研究路径样本估算；若当前测试集没有完整研究样本，则回退到 `partial_reuse` / eligible 样本，避免 `Latency Reduction` 与金额基线错误显示为 `0`。
 
 ---
 

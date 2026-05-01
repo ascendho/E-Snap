@@ -47,6 +47,10 @@ class LabelRulesPriorityTests(unittest.TestCase):
         s = _state(cache_reuse_mode="full_reuse")
         self.assertEqual(resolve_label(s)[0], "cache_semantic_reuse")
 
+    def test_dual_subquery(self):
+        s = _state(cache_reuse_mode="dual_subquery")
+        self.assertEqual(resolve_label(s)[0], "cache_dual_subquery")
+
     def test_partial_reuse(self):
         s = _state(cache_reuse_mode="partial_reuse")
         self.assertEqual(resolve_label(s)[0], "cache_partial_reuse")

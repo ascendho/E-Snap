@@ -25,12 +25,12 @@ class NormalizationTests(unittest.TestCase):
             "helloworld",
         )
 
-    def test_split_query_segments_uses_min_length_4(self):
+    def test_split_query_segments_uses_min_length_2(self):
         segments = SemanticCacheWrapper.split_query_segments("a？bb？cccc？dddddd")
+        self.assertIn("bb", segments)
         self.assertIn("cccc", segments)
         self.assertIn("dddddd", segments)
         self.assertNotIn("a", segments)
-        self.assertNotIn("bb", segments)
 
 
 def _make_fake_wrapper():

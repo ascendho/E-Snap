@@ -24,6 +24,7 @@ from workflow.nodes import (
     synthesize_response_node,
     wait_for_background_tasks,
 )
+from workflow.state import _record_llm_usage, initialize_metrics, update_metrics
 from knowledge.builder import init_app_knowledge_base
 from cache.auto_heater import setup_cache
 from common.logger import setup_logging
@@ -241,13 +242,22 @@ def _compute_elapsed_latency(start_time: float) -> float:
 
 
 def _build_stream_ready_final_event(final_state: dict, start_time: float, answer: str) -> dict:
-    """Build the user-visible stream completion payload without waiting on background tasks.
+    """Build the stream completion payload after synchronizing background metrics.
 
-    Streaming UX should complete as soon as the answer is finalized. Background cache
-    extraction may continue asynchronously after the stream closes; synchronous /chat and
-    offline flows still use `_finalize_total_latency()` for background-inclusive totals.
+    `/chat/stream` now matches `/chat` and the offline runner: the final event is emitted
+    only after background cache writeback threads have completed, so `total_latency`
+    carries one consistent definition across all entry points.
     """
-    return build_stream_final_event(final_state, _compute_elapsed_latency(start_time), answer)
+    return build_stream_final_event(final_state, _finalize_total_latency(final_state, start_time), answer)
+
+
+def _chunk_has_usage_metadata(chunk) -> bool:
+    usage_metadata = getattr(chunk, "usage_metadata", None) or {}
+    if usage_metadata:
+        return True
+    response_metadata = getattr(chunk, "response_metadata", None) or {}
+    token_usage = response_metadata.get("token_usage", {}) if isinstance(response_metadata, dict) else {}
+    return bool(token_usage)
 
 
 async def _request_disconnected(request: Request | None) -> bool:
@@ -419,6 +429,26 @@ async def chat_stream_endpoint(payload: ChatRequest, request: Request):
                 yield stream_event(STREAM_EVENT_FINAL, **_build_stream_ready_final_event(state, start_time, answer))
                 return
 
+            if route == RouteTarget.RESEARCH_SUPPLEMENT:
+                yield stream_event(STREAM_EVENT_STATUS, stage=RouteTarget.RESEARCH_SUPPLEMENT, message="正在补充缓存未覆盖的部分...")
+                await asyncio.sleep(0)
+                if await client_disconnected():
+                    return
+                state = research_supplement_node(state)
+                if await client_disconnected():
+                    return
+                state = synthesize_response_node(state)
+                answer = state.get("final_response", "")
+                for chunk in iter_text_chunks(answer):
+                    if await client_disconnected():
+                        return
+                    yield stream_event(STREAM_EVENT_TOKEN, content=chunk)
+                    await asyncio.sleep(0)
+                if await client_disconnected():
+                    return
+                yield stream_event(STREAM_EVENT_FINAL, **_build_stream_ready_final_event(state, start_time, answer))
+                return
+
             if route == RouteTarget.RERANK_CACHE:
                 yield stream_event(STREAM_EVENT_STATUS, stage=RouteTarget.RERANK_CACHE, message="正在进行缓存语义裁判...")
                 await asyncio.sleep(0)
@@ -464,29 +494,35 @@ async def chat_stream_endpoint(payload: ChatRequest, request: Request):
             await asyncio.sleep(0)
             if await client_disconnected():
                 return
-            messages, research_llm_invocations, needs_final_generation = prepare_research_messages(payload.query)
+            research_start = time.perf_counter()
+            messages, research_llm_invocations, needs_final_generation = prepare_research_messages(
+                payload.query,
+                llm_usage=state.get("llm_usage"),
+                usage_lock=state.get("llm_usage_lock"),
+            )
 
+            final_generation_calls = 1 if needs_final_generation else 0
             if needs_final_generation:
                 assembled_answer = ""
+                usage_chunk = None
                 for chunk in get_research_llm().stream(messages):
                     if await client_disconnected():
                         return
+                    if _chunk_has_usage_metadata(chunk):
+                        usage_chunk = chunk
                     piece = extract_chunk_text(chunk)
                     if not piece:
                         continue
                     assembled_answer += piece
                     yield stream_event(STREAM_EVENT_TOKEN, content=piece)
                     await asyncio.sleep(0)
-                state = {
-                    **state,
-                    "answer": assembled_answer,
-                    "research_iterations": state.get("research_iterations", 0) + 1,
-                    "execution_path": state.get("execution_path", []) + ["researched"],
-                    "llm_calls": {
-                        **state.get("llm_calls", {}),
-                        "research_llm": state.get("llm_calls", {}).get("research_llm", 0) + research_llm_invocations + 1,
-                    },
-                }
+                if usage_chunk is not None:
+                    _record_llm_usage(
+                        state.get("llm_usage"),
+                        "research",
+                        usage_chunk,
+                        usage_lock=state.get("llm_usage_lock"),
+                    )
             else:
                 final_message = messages[-1]
                 assembled_answer = getattr(final_message, "content", "") or str(final_message)
@@ -495,16 +531,24 @@ async def chat_stream_endpoint(payload: ChatRequest, request: Request):
                         return
                     yield stream_event(STREAM_EVENT_TOKEN, content=chunk)
                     await asyncio.sleep(0)
-                state = {
-                    **state,
-                    "answer": assembled_answer,
-                    "research_iterations": state.get("research_iterations", 0) + 1,
-                    "execution_path": state.get("execution_path", []) + ["researched"],
-                    "llm_calls": {
-                        **state.get("llm_calls", {}),
-                        "research_llm": state.get("llm_calls", {}).get("research_llm", 0) + research_llm_invocations,
-                    },
-                }
+
+            research_time = (time.perf_counter() - research_start) * 1000
+            metrics = update_metrics(
+                state.get("metrics", initialize_metrics()),
+                research_latency=research_time,
+                total_research_iterations=1,
+            )
+            state = {
+                **state,
+                "answer": assembled_answer,
+                "research_iterations": state.get("research_iterations", 0) + 1,
+                "execution_path": state.get("execution_path", []) + ["researched"],
+                "llm_calls": {
+                    **state.get("llm_calls", {}),
+                    "research_llm": state.get("llm_calls", {}).get("research_llm", 0) + research_llm_invocations + final_generation_calls,
+                },
+                "metrics": metrics,
+            }
 
             if await client_disconnected():
                 return
