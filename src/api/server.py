@@ -189,6 +189,8 @@ def validate_chat_request(payload: ChatRequest, client_ip: str):
 # resolve their UI badge through this table; the frontend fetches it once via /labels so
 # button text never drifts between server and client.
 # Order matters: the first matching rule wins.
+# 因此规则顺序本身就是业务语义的一部分：
+# 更具体、更强约束的标签需要排在更宽泛的标签前面，避免被后者“抢先命中”。
 LABEL_RULES: list[tuple[str, str, callable]] = [
     ("zero_intercept",      "Zero-Layer Intercept",       lambda s: s.get("intercepted", False)),
     ("cache_exact",         "Exact Cache Hit",            lambda s: s.get("cache_hit", False) and s.get("cache_match_type") == "exact"),
@@ -209,6 +211,8 @@ def resolve_label(final_state: dict) -> tuple[str, str]:
 
 
 def build_label_metadata(final_state: dict) -> dict:
+    # 后端只输出“这次回答属于哪种执行路径”的语义元数据，
+    # 不负责图标、颜色、CSS class 这类前端呈现细节。
     cache_hit = final_state.get("cache_hit", False)
     cache_match_type = final_state.get("cache_match_type", "none")
     cache_reuse_mode = final_state.get("cache_reuse_mode", "none")
@@ -275,11 +279,11 @@ async def _request_disconnected(request: Request | None) -> bool:
 def _finalize_total_latency(state: dict, start_time: float) -> float:
     """等待后台任务完成、计算响应总耗时并同步到 state['metrics']['total_latency']。
 
-    该 helper 主要服务于非流式 `/chat` 与离线 runner：
+    该 helper 主要服务于 `/chat`、`/chat/stream` 与离线 runner：
     后台子问题缓存写回的 token / 成本会被纳入本次响应统计。
 
-    `/chat/stream` 为保证用户体验，会在答案定稿后立即发出 final event，
-    不再等待后台缓存线程结束。
+    这样三个入口对 `total_latency` 的含义保持一致：
+    都表示“回答完成且后台写回也同步完成”的总墙钟时间。
     """
     if isinstance(state, dict):
         wait_for_background_tasks(state)
@@ -350,6 +354,9 @@ async def chat_endpoint(payload: ChatRequest, request: Request):
     start_time = time.time()
     
     try:
+        # `/chat` 只是 workflow 的一个同步封装层：
+        # 校验请求 -> 构造 state -> 调工作流 -> 封装响应。
+        # 业务逻辑故意不写在这里，避免 API 层与 workflow 层重复维护同一套规则。
         initial_state = build_initial_state(payload.query)
         
         # Invoke the workflow graph
@@ -373,6 +380,10 @@ async def chat_stream_endpoint(payload: ChatRequest, request: Request):
     validate_chat_request(payload, client_ip)
 
     async def event_generator():
+        # `/chat/stream` 没有直接走 `workflow_app.invoke()`，
+        # 而是手动复用同一批 node / router，以便在关键阶段向前端发送 status / token / final 事件。
+        # 因而它的关键维护原则是：节点逻辑必须和 LangGraph 主路径保持一致，
+        # 否则就会出现“同步接口正确、流式接口漂移”的问题。
         async def client_disconnected() -> bool:
             disconnected = await _request_disconnected(request)
             if disconnected:
@@ -412,6 +423,8 @@ async def chat_stream_endpoint(payload: ChatRequest, request: Request):
             if await client_disconnected():
                 return
             state = check_cache_node(state)
+            # 与 graph.py 中的 `check_cache -> cache_router` 保持同构，
+            # 这样流式模式和同步模式才能共享同一套路由语义。
             route = cache_router(state)
 
             if route == RouteTarget.SYNTHESIZE_RESPONSE:
@@ -455,6 +468,8 @@ async def chat_stream_endpoint(payload: ChatRequest, request: Request):
                 if await client_disconnected():
                     return
                 state = rerank_cache_node(state)
+                # 第二次路由同理：reranker 节点只负责写 state，
+                # 如何把 state 变成响应事件仍由这里控制。
                 route = cache_rerank_router(state)
                 if route == RouteTarget.SYNTHESIZE_RESPONSE:
                     if await client_disconnected():
@@ -495,6 +510,9 @@ async def chat_stream_endpoint(payload: ChatRequest, request: Request):
             if await client_disconnected():
                 return
             research_start = time.perf_counter()
+            # 这里复用与同步 research 相同的 message 构造逻辑，
+            # 区别只在最后的输出协议：同步模式一次性拿完整答案，
+            # 流式模式则边生成边把 token 发给前端。
             messages, research_llm_invocations, needs_final_generation = prepare_research_messages(
                 payload.query,
                 llm_usage=state.get("llm_usage"),

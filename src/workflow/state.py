@@ -88,9 +88,16 @@ class WorkflowState(TypedDict):
     ``research_iterations`` / ``current_research_strategy`` 描述路由进度。
     具体分组语义可参考 ``CacheStateView`` 与 ``RoutingStateView``。
     """
+    # --- 输入 / 输出 ---
+    # `query` 由 API / runner 在入口处写入。
+    # `answer` 是“当前阶段产出的主答案草稿”，会在多个节点间被反复覆盖。
+    # `final_response` 只在最终收口阶段稳定下来，供 API 层直接返回给用户。
     query: str
     answer: str
     final_response: Optional[str]
+
+    # --- 缓存命中原始信息（主要由 check_cache_node 写入） ---
+    # 这组字段描述“缓存层到底看到了什么”：是否命中、命中的问题是谁、相似度多少、命中类型是什么。
     cache_hit: bool
     cache_matched_question: Optional[str]
     cache_confidence: float
@@ -98,8 +105,14 @@ class WorkflowState(TypedDict):
     cache_match_type: CacheMatchType
     cache_base_answer: str
     cache_enabled: bool
+
+    # --- 路由 / 执行进度（由 pre_check / research / synthesize 等节点推进） ---
     intercepted: bool
     research_iterations: int
+
+    # --- 缓存复用裁判结果（由 check_cache_node / rerank_cache_node 写入） ---
+    # `cache_reuse_mode` 是后续 router 最核心的决策输入。
+    # 相关 reason / residual 字段用于解释为什么复用、为什么拒绝、以及还缺什么问题。
     cache_rerank_passed: bool
     cache_reuse_mode: CacheReuseMode
     cache_rerank_attempt: RerankAttempt
@@ -109,10 +122,21 @@ class WorkflowState(TypedDict):
     cache_validation_reason: str
     cache_reranker_residual_query: str
     cache_residual_query: str
+
+    # --- 缓存写回计划（主要由 supplement / synthesize 阶段生产） ---
+    # `cache_writeback_entries` 是待写回的问答对清单；
+    # `cache_written_prompts` 是已经确认写回或计划写回的 prompt，用于 UI 展示与去重。
     cache_writeback_entries: List[Dict[str, str]]
     cache_written_prompts: List[str]
+
+    # --- 当前运行轨迹 ---
+    # `execution_path` 是整个工作流的 breadcrumb，测试与报表都会依赖它进行路径分类。
     current_research_strategy: str
     execution_path: List[str]
+
+    # --- 可观测性与统计 ---
+    # `metrics` 记录节点级耗时；`llm_calls` 记录按模型族划分的调用次数；
+    # `llm_usage` 记录真实 token / 成本；`background_threads` 用于延迟的子任务写回。
     metrics: WorkflowMetrics
     timestamp: str
     llm_calls: Dict[str, int]

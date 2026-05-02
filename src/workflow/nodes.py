@@ -156,7 +156,18 @@ def pre_check_node(state: WorkflowState) -> WorkflowState:
     }
 
 def check_cache_node(state: WorkflowState) -> WorkflowState:
-    """节点：检查语义缓存（第一道防线）"""
+    """节点：检查缓存并把结果翻译成“路由可消费”的状态。
+
+    这个节点并不只是查 cache；它还负责把底层 cache engine 返回的结果
+    转成 workflow 后续真正要消费的字段，例如：
+    - `cache_hit`
+    - `cache_match_type`
+    - `cache_reuse_mode`
+    - `cache_residual_query`
+
+    尤其是 subquery 命中时，这里会提前决定它应该进入 partial_reuse fast path
+    还是直接回退到 full RAG，而不是把这个判断拖到 router 再做。
+    """
     start_time = time.perf_counter()  # 记录节点开始时间
     query = state["query"]            # 获取用户提问
     
@@ -203,8 +214,13 @@ def check_cache_node(state: WorkflowState) -> WorkflowState:
             cache_residual_query = ""
 
             if str(cache_match_type).startswith("subquery_"):
+                # subquery 命中只说明“复合问题中的某一段曾被问过”。
+                # 真正关键的是：剩余未覆盖部分能否被稳定、唯一地提取出来。
                 deterministic_residual = _derive_deterministic_subquery_residual(query, cache_matched_question)
                 if deterministic_residual:
+                    # 这里故意把 `cache_hit` 翻回 False：
+                    # 后续路径不应被当作“整题缓存命中”，而应被当作
+                    # “已有部分答案，可直接补缺口”的 partial_reuse 流程。
                     cache_hit = False
                     answer = ""
                     cache_reuse_mode = "partial_reuse"
@@ -235,6 +251,8 @@ def check_cache_node(state: WorkflowState) -> WorkflowState:
                         query,
                     )
             else:
+                # 对 exact / near_exact / edit_distance / semantic，这里只负责保留候选事实；
+                # 真正是否直出、是否 rerank，交给 router 再判断。
                 logger.info(f"   ✅ 缓存命中[{cache_match_type}] ({cache_confidence:.3f}): '{query}' -> 匹配到了 '{cache_matched_question}'")
         else:  # 未命中
             cache_hit = False
@@ -644,6 +662,8 @@ def rerank_cache_node(state: WorkflowState) -> WorkflowState:
     usage_lock = state.get("llm_usage_lock")
     original_residual_query = ""
     try:
+        # `_invoke_reranker()` 内部可能做 primary + fallback 两轮尝试；
+        # 本节点的职责是把复杂的 LLM 输出折叠成稳定的有限状态。
         result, rerank_call_count, rerank_attempt_label = _invoke_reranker(
             query,
             cached_question,
@@ -678,6 +698,8 @@ def rerank_cache_node(state: WorkflowState) -> WorkflowState:
         rerank_attempt_label = "failed"
 
     if reuse_mode == "partial_reuse":
+        # partial_reuse 不会因为模型“说可以”就直接放行；
+        # 这里还有一层纯规则后置校验，用来过滤收益不足或 residual 不可靠的情况。
         allow_partial_reuse, rejection_reason = _should_allow_partial_reuse(query, cached_answer, residual_query, score)
         if not allow_partial_reuse:
             validation_reason = rejection_reason or "partial收益不足"
@@ -779,12 +801,16 @@ def prepare_research_messages(
 
     from langchain_core.messages import ToolMessage
 
+    # research 阶段允许一次回答内部最多 3 轮“LLM -> 工具 -> LLM”往返。
+    # 这个上限是工程约束：既给模型留出补充检索空间，又避免无限工具循环。
     for _ in range(3):
         response = llm_with_tools.invoke(messages)
         _record_llm_usage(llm_usage, "research", response, usage_lock=usage_lock)
         research_llm_invocations += 1
         messages.append(response)
         if not response.tool_calls:
+            # 一旦模型决定“不再调工具”，当前 response 就已经是最终答案，
+            # 不需要额外的 final generation。
             return messages, research_llm_invocations, False
 
         for tool_call in response.tool_calls:
@@ -822,6 +848,8 @@ def prepare_research_messages(
             messages.append(ToolMessage(content=str(tool_result), tool_call_id=tool_call["id"]))
 
     if isinstance(messages[-1], ToolMessage) or (hasattr(messages[-1], "tool_calls") and messages[-1].tool_calls):
+        # 如果 3 轮结束时最后一条仍是工具结果，说明模型还没来得及把检索结果“说成人话”。
+        # 这里补一条人类提示，强制进入最后一步自然语言生成。
         messages.append(HumanMessage(content="检索已经结束，请根据以上的检索结果，用自然流利的语言直接给出答案，不要列出原始段落结构。"))
         return messages, research_llm_invocations, True
 
@@ -846,6 +874,8 @@ def execute_research(
     )
 
     if needs_final_generation:
+        # 只有当工具循环已经结束、但最后一句仍不是自然语言答案时，
+        # 才补这一轮额外生成；这样可以避免无意义的多打一枪。
         response = get_research_llm().invoke(messages)
         _record_llm_usage(llm_usage, "research", response, usage_lock=usage_lock)
         research_llm_invocations += 1
@@ -874,7 +904,14 @@ def merge_partial_answers(
     return response.content if hasattr(response, "content") else str(response)
 
 def research_node(state: WorkflowState) -> WorkflowState:
-    """节点：执行深度研究/知识库检索"""
+    """节点：执行完整 research / RAG 流程。
+
+    这条路径通常发生在两种场景：
+    - 完全未命中缓存
+    - 命中了候选，但被 reranker 明确拒绝复用
+
+    因此它代表的是“从头研究整道题”，而不是局部补充。
+    """
     start_time = time.perf_counter()  # 记录节点起始时间
     query = state["query"]            # 用户提问
     iteration = state.get("research_iterations", 0) + 1  # 轮次加 1
@@ -916,6 +953,8 @@ def research_supplement_node(state: WorkflowState) -> WorkflowState:
     logger.info("   🔒 补充研究仅检索缺口问题，原问题只用于合并答案: '%s'", residual_query)
 
     # ── 缺口缓存短路：若缺口问题本身已在 L1 缓存中，直接复用，跳过 RAG ──
+    # 这就是 dual_subquery 路径的关键：复合问题的两段都已经有缓存，
+    # 此时没必要再次调用 research 模型去“重新发现”已知答案。
     supplemental_answer: Optional[str] = None
     research_llm_invocations = 0
     _b1_from_cache = False
@@ -938,6 +977,8 @@ def research_supplement_node(state: WorkflowState) -> WorkflowState:
                 _b1_from_cache = True
 
     if supplemental_answer is None:
+        # 只有真的存在知识缺口时，才构造 supplement prompt 去做定向 research。
+        # 这里会把检索词锁定为 residual_query，避免模型在补充阶段又跑回原始整题。
         supplement_prompt = RESEARCH_PROMPT_SUPPLEMENT.format(
             cached_answer=_clip_rerank_answer(cached_answer, max_chars=400),
             residual_query=residual_query,
@@ -957,6 +998,8 @@ def research_supplement_node(state: WorkflowState) -> WorkflowState:
         final_answer = cached_answer
     elif _b1_from_cache:
         # B1: 两个子问题均来自缓存，无需 LLM 合并，直接模板拼接。
+        # 这样做的核心收益不是“省一次调用”这么简单，
+        # 而是避免合并 LLM 再次改写已知正确答案，降低无意义漂移。
         final_answer = _merge_partial_answers_without_llm(cached_answer, supplemental_answer)
     else:
         try:
@@ -1079,7 +1122,14 @@ def _cache_segments_background(
         logger.exception(f"   💥 [后台] daemon 线程崩溃，后续子问题写入已中断: {outer_exc}")
 
 def synthesize_response_node(state: WorkflowState) -> WorkflowState:
-    """节点：合成最终用户响应（并执行缓存写回）"""
+    """节点：合成最终用户响应（并执行缓存写回）。
+
+    这是整个工作流的收口点：
+    - 对用户来说，这里决定最终返回什么文本
+    - 对系统来说，这里决定哪些问法 / 子问题应该被写回缓存
+
+    也正因为写回策略集中在这里，cache engine 本身才可以保持相对“无业务”的通用接口。
+    """
     start_time = time.perf_counter()  # 记录开始时间
     
     llm_calls = state.get("llm_calls", {}).copy()
@@ -1121,8 +1171,9 @@ def synthesize_response_node(state: WorkflowState) -> WorkflowState:
         query_segments = _split_query_segments(state["query"])
         is_compound_query = len(query_segments) > 1
 
-        # 复合问题只存子问题段落，不存完整原始问题，避免缓存污染。
-        # 单问题正常写入完整 query。
+        # 对复合问题，默认优先缓存“稳定的子问题答案”，而不是立刻缓存整句问法。
+        # 这是为了避免把一次性的合并措辞、临时拼接结构过早固化成 exact cache。
+        # 单问题没有这个风险，因此可以直接写入完整 query。
         if not is_compound_query:
             logger.info(f"   💾 将研究得到的回答写入语义缓存: '{state['query'][:20]}...'")
             _store_cache_entry(state["query"], state["answer"])
@@ -1176,6 +1227,9 @@ def synthesize_response_node(state: WorkflowState) -> WorkflowState:
         and final_response
         and not _cache_contains_prompt_variant(state["query"])
     ):
+        # dual_subquery 是一个例外：
+        # 既然两段子问题都已经确定来自缓存，那么当前整句复合问法也变成了“稳定问法”，
+        # 这时写回整句可以让第三次相同提问直接走 exact / near_exact。
         logger.info(f"   💾 [dual_subquery] 将合并答案写入缓存，下次相同问题直接命中: '{state['query'][:30]}...'")
         _store_cache_entry(state["query"], final_response)
         remember_written_prompt(state["query"])
@@ -1188,6 +1242,8 @@ def synthesize_response_node(state: WorkflowState) -> WorkflowState:
         and final_response
         and not _cache_contains_prompt_variant(state["query"])
     ):
+        # semantic / subquery 经 reranker 判定为 full_reuse 后，
+        # 当前这句新问法已经被证明能安全映射到已有答案，因此值得写回为新入口。
         logger.info(f"   💾 将 full_reuse 接受后的当前问法写入缓存: '{state['query'][:20]}...'")
         _store_cache_entry(state["query"], final_response)
         remember_written_prompt(state["query"])

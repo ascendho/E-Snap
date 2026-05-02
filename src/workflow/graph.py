@@ -27,16 +27,23 @@ def create_agent_graph(sys_cache=None, kb_index=None, embeddings=None) -> StateG
     初始化并构建 LangGraph 计算图。
     
     该图定义了智能体如何处理问题：
-    1. 先查缓存 
-    2. 命中候选则做缓存复用裁判
-    3. 未命中或裁判拒绝则研究
-    4. 研究完成后直接出报告。
+    1. 先做零层拦截（时间/库存/型号类问题直接兜底）
+    2. 再查缓存，优先走 L1 fast path
+    3. 命中候选但不能直接复用时，进入 Reranker 做语义裁判
+    4. 未命中或裁判拒绝则进入 research / supplement research
+    5. 最后统一进入 synthesize_response 收口输出与缓存写回
+
+    这个函数是“全项目工作流拓扑”的单一真源：
+    - `nodes.py` 负责“每个节点内部做什么”
+    - `edges.py` 负责“节点做完后下一跳去哪里”
+    - 本函数负责把二者组装成可执行状态机
     """
     
     # --- 基础组件初始化 ---
-    # 将语义缓存实例注入节点逻辑中
+    # 将语义缓存实例注入节点逻辑中。
+    # 这样 nodes.py 内部就只关心“读写缓存”，不需要知道 cache 实例来自哪里。
     initialize_nodes(sys_cache)
-    # 如果提供了知识库索引和向量模型，则初始化相关的搜索工具
+    # 检索工具也在这里统一注入，避免 tool 模块在 import 时抢先初始化重型依赖。
     if kb_index and embeddings:
         initialize_tools(kb_index, embeddings)
 
@@ -55,7 +62,8 @@ def create_agent_graph(sys_cache=None, kb_index=None, embeddings=None) -> StateG
     # 2. 设置入口点 (Entry Point)
     workflow.set_entry_point(RouteTarget.PRE_CHECK)
 
-    # 2.5 配置前置检查到缓存的条件边缘
+    # 2.5 配置前置检查到缓存的条件边缘。
+    # pre_check 只负责写出 `intercepted=True/False`，真正决定下一跳的是 router。
     workflow.add_conditional_edges(
         RouteTarget.PRE_CHECK,
         pre_check_router,
@@ -65,7 +73,11 @@ def create_agent_graph(sys_cache=None, kb_index=None, embeddings=None) -> StateG
         },
     )
 
-    # check_cache 之后：有候选则进入 Reranker，否则直接走 RAG
+    # check_cache 之后：
+    # - exact / near_exact / edit_distance 直接进入 synthesize_response
+    # - deterministic subquery partial 直接进入 research_supplement
+    # - semantic / subquery candidate 进入 rerank_cache
+    # - 完全未命中则进入 research
     workflow.add_conditional_edges(
         RouteTarget.CHECK_CACHE,
         cache_router,
@@ -77,7 +89,10 @@ def create_agent_graph(sys_cache=None, kb_index=None, embeddings=None) -> StateG
         },
     )
 
-    # rerank_cache 之后：通过则合成回答，未通过则走 RAG
+    # rerank_cache 之后：
+    # - full_reuse 说明缓存答案已足够，直接收口
+    # - partial_reuse 只研究缺口，不重复做整题 RAG
+    # - reject 则完全放弃缓存答案，重新研究
     workflow.add_conditional_edges(
         RouteTarget.RERANK_CACHE,
         cache_rerank_router,

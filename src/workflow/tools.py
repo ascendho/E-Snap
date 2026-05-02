@@ -39,6 +39,8 @@ def initialize_tools(
         knowledge_base_index: 已连接并配置好的 RedisVL SearchIndex 实例。
         openai_embeddings: 已加载权重的向量化模型实例（如 BGE 或 OpenAI Embedding）。
     """
+    # 这里采用“启动期注入、运行期复用”的模式，而不是每次调用工具都重新构建依赖。
+    # 原因是索引连接和向量模型都属于重对象，应该在进程级别保持单例语义。
     global kb_index, embeddings      # 申明使用全局变量
     kb_index = knowledge_base_index  # 注入索引实例
     embeddings = openai_embeddings   # 注入模型实例
@@ -75,6 +77,10 @@ def search_knowledge_base(query: str, top_k: int = 3) -> str:
         query_vector = embeddings.embed(query)
 
         # --- 步骤 2: 构建混合检索语义 (Vector KNN + Text BM25) ---
+        # 这里故意保留两条信号：
+        # - 向量检索负责召回“意思接近”的内容
+        # - BM25 负责抓商品名、规则原文、专有词等字面强匹配
+        # 对客服知识库来说，这种混合检索通常比只做单一路径更稳。
         # 1. 向量相似度查询 (语义搜索)
         vec_query = VectorQuery(
             vector=query_vector,           # 搜索的“靶向”向量
@@ -120,7 +126,8 @@ def search_knowledge_base(query: str, top_k: int = 3) -> str:
         # 3. 倒排多路召回合并 (RRF 混合搜索的简明去重合并)
         seen_content = set()
         merged_results = []
-        # 交叉组装 (类似于拉链合并，将兼并字面和语义的最高分数据优先置顶)
+        # 这里采用“交叉拉链 + 去重”的轻量合并，而不是更重的二次排序：
+        # 目标是给后续 LLM 一组覆盖面稳定的上下文，而不是在工具层追求复杂排序最优。
         for i in range(max(len(vec_results), len(txt_results))):
             # 先装载语义命中的核心内容
             if i < len(vec_results):
@@ -146,7 +153,8 @@ def search_knowledge_base(query: str, top_k: int = 3) -> str:
         if not results:
             return f"注意：知识库中暂无与 '{query}' 相关的记录。"
 
-        # 将 Redis 返回的原始数据（字典列表）转换为易于 LLM 阅读的结构化文本
+        # 将 Redis 返回的原始数据（字典列表）转换为易于 LLM 阅读的结构化文本。
+        # 这里输出的是“供 research prompt 消费的上下文材料”，不是直接展示给用户的最终答案。
         formatted_results = []
         for i, result in enumerate(results, 1):
             # 距离转相关度：距离越小表示越相似。公式：1.0 - 距离

@@ -70,12 +70,31 @@ class SemanticCacheWrapper:
 
     @staticmethod
     def normalize_query(query: str) -> str:
-        """归一化 query，用于 exact fast path。"""
+        """归一化 query，用于 exact fast path。
+
+        这里刻意只做“保守归一化”：
+        - 小写化
+        - 去首尾空白
+        - 折叠连续空白
+
+        它的目标不是“尽量把不同写法揉成同一个问题”，
+        而是保证 exact 命中依然代表“几乎同一问法”。
+        更激进的清洗逻辑留给 near_exact 层处理。
+        """
         return " ".join(str(query).strip().lower().split())
 
     @staticmethod
     def normalize_surface_query(query: str) -> str:
-        """更激进的表面归一化，仅用于 near_exact fast path。"""
+        """更激进的表面归一化，仅用于 near_exact fast path。
+
+        这一层主要解决“字面形式不同、语义其实没变”的情况，例如：
+        - 全角 / 半角差异
+        - 多余空格
+        - 中英文标点差异
+
+        这里仍然是 L1 fast path，而不是 semantic matching；
+        它本质上处理的是“表面噪声”，不是“语义改写”。
+        """
         normalized = unicodedata.normalize("NFKC", str(query)).lower().strip()
         collapsed = "".join(normalized.split())
         allowed_chars = []
@@ -87,7 +106,14 @@ class SemanticCacheWrapper:
 
     @staticmethod
     def split_query_segments(query: str) -> List[str]:
-        """按常见分句符与连接词拆分复合问题，供子问题候选扫描使用。"""
+        """按常见分句符与连接词拆分复合问题，供子问题候选扫描使用。
+
+        这里的目标不是做完整自然语言句法分析，而是做一个“足够便宜”的
+        复合问题切分器，为 subquery fast path 提供候选段落。
+
+        最小长度保留在 2 个字符，是为了兼容中文里很短但合法的子问题，
+        同时避免切出大量无意义碎片。
+        """
         normalized = unicodedata.normalize("NFKC", str(query))
         for separator in ["？", "?", "！", "!", "。", "；", ";", "，", ",", "另外", "还有", "以及", "并且"]:
             normalized = normalized.replace(separator, "\n")
@@ -99,7 +125,12 @@ class SemanticCacheWrapper:
         return segments
 
     def find_subquery_candidate(self, query: str) -> Optional[CacheResult]:
-        """在复合问题中扫描已缓存子问题，命中后返回 rerank 候选。"""
+        """在复合问题中扫描已缓存子问题，命中后返回 rerank 候选。
+
+        注意这里返回的是“候选”而不是直接整句命中：
+        某个子问题问过，并不等于整个复合问题都已经被回答。
+        后续是否能直接复用、是否只补缺口，交给 workflow 层再决定。
+        """
         for segment in self.split_query_segments(query):
             normalized_segment = self.normalize_query(segment)
             exact_match = self._normalized_question_map.get(normalized_segment)
@@ -253,6 +284,18 @@ class SemanticCacheWrapper:
         return False
 
     def check(self, query: str, distance_threshold: Optional[float] = None, num_results: int = 1) -> CacheResults:
+        """统一缓存查询入口。
+
+        真实顺序是：
+        1. L1 exact
+        2. L1 near_exact
+        3. L1 edit_distance
+        4. L1 subquery
+        5. L2 semantic cache
+
+        前四层都属于“便宜、确定性更高”的快速路径；
+        只有它们都失败后，才值得支付向量检索成本。
+        """
         # ===== L1 exact fast path：归一化后完全一致则直接命中 =====
         if CACHE_L1_EXACT_ENABLED:
             normalized_query = self.normalize_query(query)
@@ -270,6 +313,7 @@ class SemanticCacheWrapper:
                     )
                 ])
 
+            # near_exact 仍然属于“同一问法的表面噪声”，所以继续留在 L1 fast path。
             near_exact_query = self.normalize_surface_query(query)
             near_exact_match = self._near_exact_question_map.get(near_exact_query)
             if near_exact_match:
@@ -286,14 +330,19 @@ class SemanticCacheWrapper:
                 ])
 
             if CACHE_L1_EDIT_DISTANCE_ENABLED:
+                # edit_distance 放在 near_exact 之后：
+                # 只有前两层都失败时，才把错别字 / OCR 这类微小扰动当作候选。
                 edit_distance_candidate = self.find_edit_distance_candidate(query)
                 if edit_distance_candidate:
                     return CacheResults(query=query, matches=[edit_distance_candidate])
 
+            # subquery 检查放在 semantic 前面，是为了优先利用“确定的局部复用信息”，
+            # 避免复合问题一上来就掉入更昂贵、更不透明的向量召回。
             subquery_candidate = self.find_subquery_candidate(query)
             if subquery_candidate:
                 return CacheResults(query=query, matches=[subquery_candidate])
         
+        # 到达这里说明所有 L1 fast path 都没拦住，才进入 L2 semantic cache。
         candidates = self.cache.check(query, distance_threshold=distance_threshold, num_results=num_results)
         
         if not candidates:
@@ -302,6 +351,7 @@ class SemanticCacheWrapper:
         results: List[CacheResult] = []
         for item in candidates[:num_results]:
             result = dict(item)
+            # RedisVL 返回的是 vector_distance；workflow 层更常用 cosine_similarity 来记录与展示。
             result["vector_distance"] = float(result.get("vector_distance", 0.0))
             result["cosine_similarity"] = float((2 - result["vector_distance"]) / 2)
             result["query"] = query
