@@ -29,9 +29,9 @@ def main():
     # 将原始 Markdown 文本进行切块、向量化并写入 Redis 向量索引。
     logger.info("初始化知识库 ......")
 
-    # kb_index: Redis 向量索引对象（SearchIndex 实例）。
+    # `kb_index`：Redis 向量索引对象（SearchIndex 实例）。
     #           它像是一个“带索引的图书馆”，负责执行底层的向量相似度检索。
-    # embeddings: 向量化模型对象（HFTextVectorizer 实例）。
+    # `embeddings`：向量化模型对象（HFTextVectorizer 实例）。
     #           它是“翻译官”，负责将用户的中文提问转换成计算机能理解的 1024 维向量。
     kb_index, embeddings = init_app_knowledge_base()
 
@@ -39,9 +39,10 @@ def main():
     # 步骤 2) 初始化语义缓存 (Semantic Cache)
     # ---------------------------------------------------------
     # 语义缓存用于拦截意思相近的重复提问，直接返回答案，无需经过大模型推理。
+    # setup_cache() 内部会读取 data/faq_seed.csv，并在启动期完成 FAQ 种子预热。
     logger.info("初始化语义缓存 ......")
     
-    # cache 实例包含了 Redis 连接和预加载的 FAQ 种子数据。
+    # `cache` 实例包含 Redis 连接和预加载的 FAQ 种子数据。
     cache = setup_cache()
 
     # ---------------------------------------------------------
@@ -50,7 +51,7 @@ def main():
     # 将业务节点（缓存检查、缓存裁判、研究、合成）和路由逻辑编排成一个状态机。
     logger.info("构建 LangGraph 工作流计算图...")
     
-    # 注入前面初始化的缓存和知识库组件，生成可执行的 Workflow 对象
+    # 注入前面初始化的缓存和知识库组件，生成可执行的工作流对象
     workflow_app = create_agent_graph(cache, kb_index, embeddings)
 
     # ---------------------------------------------------------

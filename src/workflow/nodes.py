@@ -94,6 +94,17 @@ PARTIAL_REUSE_SHORT_RESIDUAL_MIN_SCORE = 0.90
 PARTIAL_REUSE_SHORT_RESIDUAL_MAX_CHARS = 5
 PARTIAL_REUSE_SHORT_RESIDUAL_MAX_RATIO = 0.30
 PARTIAL_REUSE_MAX_CACHED_ANSWER_CHARS = 320
+# 这是 reranker 的降级 prompt：
+# - 主路径优先使用 prompts.py 中的 RERANK_SYSTEM_PROMPT + RERANK_PROMPT 做结构化输出
+# - 只有主路径解析失败时，才退回这条更短、更强约束的 JSON-only prompt
+#
+# 从“总共有几条 prompt”这个角度看，它属于项目里额外的特化 prompt 之一：
+# - prompts.py 中有 6 条主 prompt
+# - 本文件里至少还有 3 条调用侧特化 prompt / prompt-like 字符串：
+#   `RERANK_FALLBACK_PROMPT`、`_SEGMENT_EXTRACT_PROMPT`、以及 pre_check 中的固定拒答文案
+#
+# 它不放在 prompts.py 里，是因为它本质上属于 `_invoke_reranker()` 的异常降级策略，
+# 与调用侧的长度裁剪、解析失败处理紧密耦合。
 RERANK_FALLBACK_PROMPT = """请仅输出一行 JSON，不要加解释。\n"
 RERANK_FALLBACK_PROMPT += '{"reuse_mode":"full_reuse|partial_reuse|reject","score":0.0,"reason":"不超过20字","residual_query":"partial_reuse 时填写，否则留空"}\n'
 RERANK_FALLBACK_PROMPT += "新问题：{query}\n旧问题：{cached_question}\n旧答案摘要：{cached_answer_excerpt}"""
@@ -411,6 +422,8 @@ def _invoke_reranker(
     )
 
     try:
+        # 主路径：使用 prompts.py 中定义的 rerank prompt 组合，
+        # 让 analysis_llm 输出结构化的 RerankerEvaluation。
         structured_llm = get_analysis_llm().with_structured_output(RerankerEvaluation, include_raw=True)
         result_bundle = structured_llm.invoke([
             SystemMessage(content=RERANK_SYSTEM_PROMPT),
@@ -437,6 +450,9 @@ def _invoke_reranker(
             primary_exc,
         )
         try:
+            # 降级路径：继续沿用同一个 RERANK_SYSTEM_PROMPT，
+            # 但 human message 改为更短、更死板的 RERANK_FALLBACK_PROMPT，
+            # 以提高 JSON 可解析性。
             raw_result = get_analysis_llm().invoke([
                 SystemMessage(content=RERANK_SYSTEM_PROMPT),
                 HumanMessage(content=RERANK_FALLBACK_PROMPT.format(
@@ -810,9 +826,13 @@ def prepare_research_messages(
     """
     tools = [search_knowledge_base]
     research_llm_invocations = 0
+    # 默认走 prompts.py 中的 RESEARCH_PROMPT_INITIAL；
+    # 只有 supplement 场景才会从调用侧传入自定义 prompt_text 覆盖它。
     research_prompt = prompt_text or RESEARCH_PROMPT_INITIAL.format(query=query)
     llm_with_tools = get_research_llm().bind_tools(tools)
     messages = [
+        # research 系列都会先挂 SYSTEM_PROMPT，先把身份边界与拒答边界钉死，
+        # 再让人类消息决定“这次是 full research 还是 supplement research”。
         SystemMessage(content=SYSTEM_PROMPT),
         HumanMessage(content=research_prompt),
     ]
@@ -917,6 +937,9 @@ def merge_partial_answers(
     usage_lock: Optional[Any] = None,
 ) -> str:
     """将缓存答案与补充研究结果合并为最终回复。"""
+    # 这里不会调用工具，也不会重新 research；
+    # 它只消费 prompts.py 中的 PARTIAL_REUSE_MERGE_PROMPT，
+    # 把 cached_answer 与 supplemental_answer 统一整理成一条面向用户的最终回复。
     response = get_research_llm().invoke([
         SystemMessage(content=SYSTEM_PROMPT),
         HumanMessage(content=PARTIAL_REUSE_MERGE_PROMPT.format(
@@ -1014,6 +1037,7 @@ def research_supplement_node(state: WorkflowState) -> WorkflowState:
     if supplemental_answer is None:
         # 只有真的存在知识缺口时，才构造 supplement prompt 去做定向 research。
         # 这里会把检索词锁定为 residual_query，避免模型在补充阶段又跑回原始整题。
+        # 这里实际消费的就是 prompts.py 里的 RESEARCH_PROMPT_SUPPLEMENT。
         supplement_prompt = RESEARCH_PROMPT_SUPPLEMENT.format(
             cached_answer=_clip_rerank_answer(cached_answer, max_chars=400),
             residual_query=residual_query,
@@ -1125,6 +1149,9 @@ _SEGMENT_EXTRACT_PROMPT = (
     "不超过200字，直接输出答案文本，不要加任何前缀或解释。\n\n"
     "复合问题完整回答：\n{combined_answer}"
 )
+# 这条 prompt 不放进 prompts.py 的原因与 fallback prompt 类似：
+# 它只服务于 synthesize 阶段的后台子问题拆分写回，
+# 与 `_cache_segments_background()` 的线程化写回逻辑紧耦合，复用面很窄。
 
 def _cache_segments_background(
     segments: List[str],

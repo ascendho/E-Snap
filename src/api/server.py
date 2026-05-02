@@ -34,18 +34,21 @@ warnings.simplefilter("ignore")
 
 app = FastAPI(title="E-Snap API", version="1.0.0")
 
-# Setup CORS to allow your frontend
+# 配置 CORS，允许前端页面访问本后端接口
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Adjust this to point to the Netlify/GitHub branch URL later
+    allow_origins=["*"],  # 若后续部署到固定域名，应收紧为真实前端来源地址
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Configuration for security
+# 安全相关配置
 ACCESS_CODE = os.environ.get("ACCESS_CODE", "HIRE_ME_2026")
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
+
+# 运行时数据库产品仍然只有同一套 Redis；
+# API 层额外把它拿来存放限流计数等轻量键值，而不是新的独立数据库。
 
 logger = setup_logging()
 workflow_app = None
@@ -77,6 +80,8 @@ def init_system():
     kb_index, embeddings = init_app_knowledge_base()
 
     update_system_status("warming_cache", "Warming FAQ cache...")
+    # Web 服务启动时同样会走 FAQ 缓存预热，
+    # 因此 API 第一个请求到来前，常见标准问答已经写入缓存。
     cache = setup_cache()
     cache_entry_count = len(getattr(cache, "_answer_by_question", {}) or {})
     cache_has_contact_prompt = bool(getattr(cache, "contains_prompt_variant", lambda prompt: False)("怎么联系人工？"))
@@ -92,6 +97,8 @@ def init_system():
     workflow_app = create_agent_graph(cache, kb_index, embeddings)
 
     update_system_status("connecting_redis", "Connecting API Redis client...")
+    # 这里拿到的是 API 自己使用的 Redis client，主要承担限流等轻量键值用途；
+    # 它与缓存层、知识库索引层物理上是同一套 Redis，只是逻辑 key 空间不同。
     redis_client = Redis.from_url(REDIS_URL, decode_responses=True)
 
     update_system_status("ready", "Backend ready. You can start chatting now.", ready=True)
@@ -110,9 +117,9 @@ async def startup_event():
         logger.exception("Application startup failed")
         raise
 
-# Simple dependency injection to verify access code
+# 访问码校验占位依赖；当前真正校验仍在 validate_chat_request 中完成
 async def verify_access_code(authorization: str = None):
-    # Depending on how the frontend sends it, we can look at the header `X-Access-Code` or `Authorization`
+    # 取决于前端如何传递访问码，这里理论上可兼容 `X-Access-Code` 或 `Authorization`
     pass
 
 class ChatRequest(BaseModel):
@@ -149,11 +156,11 @@ async def health_check():
         "process_id": os.getpid(),
     }
 
-# Simple IP rate restrictor helper
+# 简单的按 IP 限流辅助函数
 def check_rate_limit(ip: str):
     if not redis_client:
         return
-    # Allow 10 requests per minute per IP
+    # 每个 IP 每分钟最多允许 10 次请求
     key = f"rate_limit:{ip}"
     current = redis_client.get(key)
     if current and int(current) > 10:
@@ -185,10 +192,10 @@ def validate_chat_request(payload: ChatRequest, client_ip: str):
 
     check_rate_limit(client_ip)
 
-# Single-source-of-truth label rules. Both /chat (sync) and /chat/stream (final event)
-# resolve their UI badge through this table; the frontend fetches it once via /labels so
-# button text never drifts between server and client.
-# Order matters: the first matching rule wins.
+# 标签规则的单一真源。
+# `/chat`（同步）与 `/chat/stream`（最终事件）都通过这张表决定 UI badge 文案；
+# 前端会在启动时从 `/labels` 拉取一次，避免前后端各自维护导致文案漂移。
+# 规则顺序本身有意义：第一个命中的规则获胜。
 # 因此规则顺序本身就是业务语义的一部分：
 # 更具体、更强约束的标签需要排在更宽泛的标签前面，避免被后者“抢先命中”。
 LABEL_RULES: list[tuple[str, str, callable]] = [
@@ -246,11 +253,11 @@ def _compute_elapsed_latency(start_time: float) -> float:
 
 
 def _build_stream_ready_final_event(final_state: dict, start_time: float, answer: str) -> dict:
-    """Build the stream completion payload after synchronizing background metrics.
+    """在同步完后台统计后，构造流式响应的最终完成事件。
 
-    `/chat/stream` now matches `/chat` and the offline runner: the final event is emitted
-    only after background cache writeback threads have completed, so `total_latency`
-    carries one consistent definition across all entry points.
+    现在 `/chat/stream` 与 `/chat`、离线 runner 保持一致：
+    只有后台缓存写回线程完成后，才会发出最终事件。
+    因而 `total_latency` 在所有入口里都共享同一套定义。
     """
     return build_stream_final_event(final_state, _finalize_total_latency(final_state, start_time), answer)
 
@@ -296,7 +303,7 @@ def _finalize_total_latency(state: dict, start_time: float) -> float:
         metrics["total_latency"] = latency
     return latency
 
-# Stream event type discriminators. Keep these in sync with frontend/app.js.
+# 流式事件类型常量。这里必须与 frontend/app.js 保持同步。
 STREAM_EVENT_STATUS = "status"
 STREAM_EVENT_TOKEN = "token"
 STREAM_EVENT_FINAL = "final"
@@ -336,10 +343,10 @@ async def validate_code(request: ValidateRequest):
 
 @app.get("/labels")
 async def list_labels():
-    """Expose the label key→text mapping so the frontend never duplicates the rule text.
+    """暴露 label key -> text 的映射，避免前端重复硬编码规则文案。
 
-    The frontend fetches this once on load and uses it to populate badge captions; CSS
-    classes remain client-side because they are presentation concerns.
+    前端会在加载时请求一次它，并用它填充 badge 文案；
+    CSS class 仍然留在客户端，因为那属于呈现层决策。
     """
     labels = {key: text for key, text, _ in LABEL_RULES}
     labels[DEFAULT_LABEL[0]] = DEFAULT_LABEL[1]
@@ -359,7 +366,7 @@ async def chat_endpoint(payload: ChatRequest, request: Request):
         # 业务逻辑故意不写在这里，避免 API 层与 workflow 层重复维护同一套规则。
         initial_state = build_initial_state(payload.query)
         
-        # Invoke the workflow graph
+        # 调用 workflow 计算图
         final_state = workflow_app.invoke(initial_state)
         
         latency = _finalize_total_latency(final_state, start_time)
@@ -601,6 +608,6 @@ async def favicon() -> Response:
 async def apple_touch_icon() -> Response:
     return Response(status_code=204)
 
-# --- Mount Frontend Static Files ---
-# Important: This must be mounted AFTER API routes, otherwise it will intercept API calls.
+# --- 挂载前端静态资源 ---
+# 必须放在 API 路由之后，否则它会抢先拦截 API 请求。
 app.mount("/", StaticFiles(directory="frontend", html=True), name="frontend")

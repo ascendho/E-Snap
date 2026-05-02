@@ -9,10 +9,10 @@ def setup_logging():
     2. 定义日志记录的字符串格式（时间、级别、内容）。
     3. 返回一个特定名称的日志对象供后续调用。
     
-    Returns:
+    返回：
         logging.Logger: 配置好的日志记录器实例。
     """
-    # basicConfig 是最简单的配置日志的方法
+    # `basicConfig` 是最简单的日志配置入口
     logging.basicConfig(
         # 设置日志级别为 INFO。
         # 级别顺序：DEBUG < INFO < WARNING < ERROR < CRITICAL
@@ -27,10 +27,11 @@ def setup_logging():
     )
     
     # 获取（或创建）一个名为 "agentic-workflow" 的日志记录器。
-    # 使用命名的 logger 而不是根 logger (root) 是为了在大型应用中更好地标识日志来源。
+    # 使用具名日志记录器而不是根记录器（root），是为了在大型应用中更好地标识日志来源。
     return logging.getLogger("agentic-workflow")
 
 # --- 使用示例 ---
+# 如果把本文件当作脚本直接运行：
 # if __name__ == "__main__":
 #     logger = setup_logging()
 #     logger.info("日志系统已启动")  # 输出: 2023-10-27 10:00:00,000 | INFO | 日志系统已启动

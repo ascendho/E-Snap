@@ -1,13 +1,13 @@
-"""工作流状态边界与状态相关 helper。
+"""工作流状态边界与状态相关辅助函数。
 
-Phase 2 重构目标：把以前散落在 ``nodes.py`` 顶部的状态类型定义、初始化、
-LLM usage 累计、后台任务等待这些“横切”逻辑集中到独立模块，让 ``nodes.py``
+第二阶段重构目标：把以前散落在 ``nodes.py`` 顶部的状态类型定义、初始化、
+LLM 用量累计、后台任务等待这些“横切”逻辑集中到独立模块，让 ``nodes.py``
 回归节点实现职责。
 
 为了不破坏既有调用者（``graph.py`` / ``api/server.py`` / ``tests/runner.py``），
 ``nodes.py`` 仍会再导出本模块的全部公共名字。本次保留单一扁平的
 ``WorkflowState`` 不做一次性迁移，仅提供 ``CacheStateView`` /
-``RoutingStateView`` 等 ``total=False`` 子视图作为读侧文档与未来分组依据。
+``RoutingStateView`` 等 ``total=False`` 子视图，作为读侧文档与未来分组依据。
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ logger = logging.getLogger("agentic-workflow")
 
 
 # ---------------------------------------------------------------------------
-# Type aliases
+# 类型别名
 # ---------------------------------------------------------------------------
 
 CacheMatchType = Literal[
@@ -48,7 +48,7 @@ ModelFamily = Literal["analysis", "research"]
 
 
 # ---------------------------------------------------------------------------
-# TypedDicts
+# 类型字典结构定义
 # ---------------------------------------------------------------------------
 
 class LLMUsage(TypedDict):
@@ -132,7 +132,7 @@ class WorkflowState(TypedDict):
     cache_written_prompts: List[str]
 
     # --- 当前运行轨迹 ---
-    # `execution_path` 是整个工作流的 breadcrumb，测试与报表都会依赖它进行路径分类。
+    # `execution_path` 是整个工作流的面包屑轨迹，测试与报表都会依赖它进行路径分类。
     current_research_strategy: str
     execution_path: List[str]
 
@@ -148,7 +148,7 @@ class WorkflowState(TypedDict):
 
 
 # ---------------------------------------------------------------------------
-# Sub-views (documentation only — WorkflowState 仍为扁平结构)
+# 子视图（仅用于文档说明，WorkflowState 仍保持扁平结构）
 # ---------------------------------------------------------------------------
 
 class CacheStateView(TypedDict, total=False):
@@ -182,7 +182,7 @@ class RoutingStateView(TypedDict, total=False):
 
 
 # ---------------------------------------------------------------------------
-# Initializers
+# 初始化函数
 # ---------------------------------------------------------------------------
 
 def initialize_metrics() -> WorkflowMetrics:
@@ -268,7 +268,7 @@ def update_metrics(metrics: WorkflowMetrics, **kwargs) -> WorkflowMetrics:
 
 
 # ---------------------------------------------------------------------------
-# LLM usage accounting
+# 大模型调用用量统计
 # ---------------------------------------------------------------------------
 
 def _extract_token_usage(response: Any) -> Dict[str, int]:
@@ -360,7 +360,7 @@ def _record_llm_usage(
 
 
 # ---------------------------------------------------------------------------
-# Background task synchronization
+# 后台任务同步
 # ---------------------------------------------------------------------------
 
 def wait_for_background_tasks(state: WorkflowState) -> WorkflowState:

@@ -7,7 +7,7 @@ body {
     overflow-y: auto;
 }
 
-/* Scrollbar Styles */
+/* 滚动条样式 */
 ::-webkit-scrollbar {
     width: 6px;
 }

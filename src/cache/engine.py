@@ -33,9 +33,9 @@ def try_connect_to_redis(redis_url: str):
     try:
         r = redis.Redis.from_url(redis_url)
         # --- 生产级安全对齐：容量与淘汰策略 ---
-        # 1. 限制 Redis 最大内存为100MB，防止恶意攻击或大规模缓存导致服务器 OOM (Out Of Memory)
+        # 1. 限制 Redis 最大内存为 100MB，防止恶意攻击或大规模缓存导致服务器内存耗尽
         r.config_set("maxmemory", "100mb")
-        # 2. 设置淘汰策略：当容量达到上限时，淘汰全库最近最少使用的 Key (allkeys-lru)
+        # 2. 设置淘汰策略：当容量达到上限时，淘汰全库最近最少使用的键（allkeys-lru）
         r.config_set("maxmemory-policy", "allkeys-lru")
         
         r.ping()
@@ -50,13 +50,31 @@ class SemanticCacheWrapper:
         """
         初始化语义缓存引擎。
         使用单一配置源 common.env，移除多余初始化与 TTL 生命周期管理。
+
+                从“用了几个数据库”这个角度看：
+                - 物理数据库产品只有 1 个：Redis
+                - 但逻辑上至少承载了 3 类缓存相关存储：
+                    1. L1 进程内 Python map
+                    2. L2 RedisVL SemanticCache
+                    3. RedisVL EmbeddingsCache（向量化结果缓存）
+
+        当前实现不是“L1 单独向量库 + L2 单独 KV 库”的双库架构，
+        而是更轻量的逻辑双层：
+        - L1: 进程内 Python map，负责 exact / near_exact / edit_distance 这类确定性快速路径
+        - L2: RedisVL SemanticCache，负责语义向量检索
+
+        这种设计更适合当前项目体量：实现简单、写回路径统一、调试成本低。
         """
         self.redis = try_connect_to_redis(REDIS_URL)
         
         # 移除 TTL，缓存数据基于物理清理而非时间过期
+        # `embeddings_cache` 也存放在 Redis 中，但它缓存的是“文本 -> 向量”的中间结果，
+        # 不是直接面向用户回答的问答缓存。
         self.embeddings_cache = EmbeddingsCache(redis_client=self.redis)
         self.langcache_embed = HFTextVectorizer(model=embeddings_model, cache=self.embeddings_cache)
         
+        # `self.cache` 是 L2 semantic cache 的真实承载者：
+        # prompt / response 对及其向量信息最终都会写进 RedisVL 管理的索引中。
         self.cache = SemanticCache(
             name=CACHE_NAME, 
             vectorizer=self.langcache_embed, 
@@ -65,12 +83,12 @@ class SemanticCacheWrapper:
         )
         self._seed_id_by_question: Dict[str, int] = {}
         self._answer_by_question: Dict[str, str] = {}
-        # L1 fast path 的两个 map 都是“归一化后的 query -> 原问题文本”，
+        # L1 快速路径的两个映射表都是“归一化后的 query -> 原问题文本”，
         # 而不是“归一化后的 query -> 答案”。
         # 这样做的目的，是把“用户当时真实问法”保留为中间层：
         # 先用归一化 key 找到原问题，再用原问题去 _answer_by_question 查答案。
         # 这能让缓存层同时兼顾：
-        # 1) 快速查找；2) 保留原始 prompt；3) 让 seed_id / answer / prompt 三者保持同一主键。
+        # 1) 快速查找；2) 保留原始问句；3) 让 seed_id / answer / prompt 三者保持同一主键。
         self._normalized_question_map: Dict[str, str] = {}
         self._near_exact_question_map: Dict[str, str] = {}
 
@@ -179,6 +197,11 @@ class SemanticCacheWrapper:
         `max_distance` 既是匹配阈值，也是性能剪枝条件：
         一旦某一整行的最小值已经大于上限，后续就不可能再回到可接受范围，
         因此可以提前结束，避免在 L1 typo 检查里浪费 CPU。
+
+        在当前项目里默认值设为 1，原因是：
+        - 前面已经有 near_exact 层先处理空格、全半角、标点这类高频表面差异
+        - edit_distance 层只需要兜住“再多一个轻微字符错误”的场景即可
+        - 若默认直接升到 2，对中文商品名/规则问句更容易误召回相邻但不同的问题
         """
         if source == target:
             return 0
@@ -213,11 +236,14 @@ class SemanticCacheWrapper:
         """用小编辑距离识别错别字、同音字和 OCR 噪声。
 
         它解决的是“同一个问题打错了一两个字”的场景，而不是语义改写：
-        - 例如：商品名错一个字、OCR 少一个标点、输入法误按
+        - 例如：商品名错一个字、OCR 识别少一个标点、输入法误按
         - 不负责判断“两个不同说法是否语义相近”，那属于 semantic cache / reranker 的职责
 
+        这里的 OCR 噪声，指的是图片转文字或复制录入时产生的表面字符偏差，
+        例如标点丢失、全半角混乱、个别字符识别错误。
+
         返回值只会是“最佳单候选”或 None，不会返回多个近似问题。
-        这样可以让 L1 fast path 继续保持确定性和低成本。
+        这样可以让 L1 快速路径继续保持确定性和低成本。
         """
         normalized_query = self.normalize_surface_query(query)
         best_match = None
@@ -249,7 +275,7 @@ class SemanticCacheWrapper:
         )
 
     def clear(self):
-        """物理清空整个向量索引和相关数据"""
+        """物理清空整个向量索引和相关数据。"""
         print("正在彻底清空旧语义缓存数据...")
         for key in self.redis.scan_iter(f"{self.cache.index.name}:*"):
             self.redis.delete(key)
@@ -280,7 +306,7 @@ class SemanticCacheWrapper:
             self.register_entry(item["question"], item["answer"], seed_id=item.get("id"))
 
     def register_entry(self, prompt: str, answer: str, seed_id: Optional[int] = None) -> None:
-        """Write `(prompt, answer)` into the vector store and refresh the L1 lookup maps.
+        """把 `(prompt, answer)` 写入缓存，并同步刷新所有 L1 查询 map。
 
         这是整个缓存系统的统一写入口：
         - FAQ seed 预热时会走这里
@@ -309,7 +335,7 @@ class SemanticCacheWrapper:
         self._near_exact_question_map[self.normalize_surface_query(prompt_str)] = prompt_str
 
     def contains_prompt_variant(self, prompt: str) -> bool:
-        """True if a normalized form of `prompt` is already registered in L1 maps.
+        """判断 `prompt` 的归一化变体是否已经登记在 L1 map 中。
 
         这里检查的是“这个问法的归一化变体是否已经存在”，不是语义相似度判断。
         典型用途是写回前去重：
@@ -338,6 +364,22 @@ class SemanticCacheWrapper:
 
         前四层都属于“便宜、确定性更高”的快速路径；
         只有它们都失败后，才值得支付向量检索成本。
+
+        所以当前项目的 L1/L2 更接近“分层决策顺序”，
+        而不是论文里常见的“两套独立物理存储之间用 ID 串起来”的架构。
+
+                取数位置也因此分成两种：
+                - 命中 L1：先从 `_normalized_question_map` / `_near_exact_question_map` 拿到原问题文本，
+                    再从 `_answer_by_question` 这个进程内 dict 取答案
+                - 命中 L2：由 `self.cache.check()` 从 RedisVL semantic cache 返回候选记录，
+                    再把候选里的 response / vector_distance 封装成 CacheResult
+
+        可以用几种典型问句来理解每一层：
+        - exact: “你们支持几天无理由退换？” 直接命中 FAQ 原问句
+        - near_exact: “你们  支持几天无理由退换？” 只差空格/标点
+        - edit_distance: “你们支持几天无理由退货？” 只有一两个轻微字符偏差
+        - subquery: “你们支持几天无理由退换？还有怎么联系人工？” 中的单个子问题已在缓存里
+        - semantic: “贵公司的退货政策是什么？” 虽然字面不同，但语义上接近 FAQ 里的退换货问句
         """
         # ===== L1 exact fast path：归一化后完全一致则直接命中 =====
         if CACHE_L1_EXACT_ENABLED:
@@ -346,6 +388,7 @@ class SemanticCacheWrapper:
             # exact_match 取到的是“原问题文本”，不是答案。
             # 下一步再用这个原问题文本去 _answer_by_question 里拿答案，
             # 这样可以保持 prompt / answer / seed_id 三者都以同一个原问题为主键。
+            # 也就是说：L1 exact 命中后的最终答案来源，是进程内的 `_answer_by_question`。
             if exact_match:
                 print(f"⚡ [精确命中] normalized exact hit: '{query}' -> '{exact_match}'")
                 return CacheResults(query=query, matches=[
@@ -359,10 +402,13 @@ class SemanticCacheWrapper:
                     )
                 ])
 
-            # near_exact 仍然属于“同一问法的表面噪声”，所以继续留在 L1 fast path。
+            # near_exact 仍然属于“同一问法的表面噪声”，所以继续留在 L1 快速路径。
+            # 例如：同一句 FAQ 只是多了空格、换了全角标点，不值得进入向量检索。
             near_exact_query = self.normalize_surface_query(query)
             near_exact_match = self._near_exact_question_map.get(near_exact_query)
             if near_exact_match:
+                # near_exact 与 exact 一样，真正的答案也来自 `_answer_by_question`，
+                # `_near_exact_question_map` 只负责把变体问法映射回原问题文本。
                 print(f"⚡ [近精确命中] normalized surface hit: '{query}' -> '{near_exact_match}'")
                 return CacheResults(query=query, matches=[
                     CacheResult(
@@ -378,17 +424,20 @@ class SemanticCacheWrapper:
             if CACHE_L1_EDIT_DISTANCE_ENABLED:
                 # edit_distance 放在 near_exact 之后：
                 # 只有前两层都失败时，才把错别字 / OCR 这类微小扰动当作候选。
+                # 例如“退换”误写成“退货”这类轻微字符偏差，才值得进入这一层兜底。
                 edit_distance_candidate = self.find_edit_distance_candidate(query)
                 if edit_distance_candidate:
                     return CacheResults(query=query, matches=[edit_distance_candidate])
 
             # subquery 检查放在 semantic 前面，是为了优先利用“确定的局部复用信息”，
             # 避免复合问题一上来就掉入更昂贵、更不透明的向量召回。
+            # 例如“退换货政策？还有怎么联系人工？” 至少可以先复用“怎么联系人工”这一段已知答案。
             subquery_candidate = self.find_subquery_candidate(query)
             if subquery_candidate:
                 return CacheResults(query=query, matches=[subquery_candidate])
         
-        # 到达这里说明所有 L1 fast path 都没拦住，才进入 L2 semantic cache。
+        # 到达这里说明所有 L1 快速路径都没拦住，才进入 L2 semantic cache。
+        # 这一层处理的是“字面不同但意思接近”的问法，例如“退货政策是什么？” vs FAQ 标准问句。
         candidates = self.cache.check(query, distance_threshold=distance_threshold, num_results=num_results)
         
         if not candidates:
@@ -397,7 +446,9 @@ class SemanticCacheWrapper:
         results: List[CacheResult] = []
         for item in candidates[:num_results]:
             result = dict(item)
-            # RedisVL 返回的是 vector_distance；workflow 层更常用 cosine_similarity 来记录与展示。
+            # RedisVL 返回的是 vector_distance；工作流层更常用 cosine_similarity 来记录与展示。
+            # 这里的 response 已经来自 L2 semantic cache 的候选记录，
+            # 不再经过 `_answer_by_question` 二次取数。
             result["vector_distance"] = float(result.get("vector_distance", 0.0))
             result["cosine_similarity"] = float((2 - result["vector_distance"]) / 2)
             result["query"] = query

@@ -15,7 +15,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const quickActions = document.getElementById('quick-actions');
     const quickPills = document.querySelectorAll('.quick-pill');
 
-    // Automatically adapt to current host domain for full-stack deployment
+    // 自动适配当前宿主域名，方便前后端一体部署
     const CHAT_API_URL = '/chat/stream';
     const VALIDATE_URL = '/validate';
     const HEALTH_URL = '/health';
@@ -41,7 +41,7 @@ document.addEventListener('DOMContentLoaded', () => {
         composerStopBtn.classList.toggle('cursor-wait', Boolean(visible && stopping));
     };
 
-    // Theme Management
+    // 主题切换管理
     if (localStorage.getItem('color-theme') === 'dark') {
         document.documentElement.classList.add('dark');
         themeToggleLightIcon.classList.remove('hidden');
@@ -72,11 +72,11 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     });
 
-    // Password Eye Toggle
+    // 密码可见性切换
     togglePwdBtn.addEventListener('click', () => {
         const type = accessCodeInput.getAttribute('type') === 'password' ? 'text' : 'password';
         accessCodeInput.setAttribute('type', type);
-        // Switch SVG based on type
+        // 根据当前输入框类型切换图标 SVG
         if(type === 'text') {
             togglePwdBtn.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-4 h-4 text-gray-800 dark:text-gray-200"><path stroke-linecap="round" stroke-linejoin="round" d="M3.98 8.223A10.477 10.477 0 001.934 12C3.226 16.338 7.244 19.5 12 19.5c.993 0 1.953-.138 2.863-.395M6.228 6.228A10.45 10.45 0 0112 4.5c4.756 0 8.773 3.162 10.065 7.498a10.523 10.523 0 01-4.293 5.774M6.228 6.228L3 3m3.228 3.228l3.65 3.65m7.894 7.894L21 21m-3.228-3.228l-3.65-3.65m0 0a3 3 0 10-4.243-4.243m4.242 4.242L9.88 9.88" /></svg>';
         } else {
@@ -100,7 +100,7 @@ document.addEventListener('DOMContentLoaded', () => {
         accessCodeInput.focus();
     };
 
-    // Access Key Persistence
+    // 访问码持久化
     let finalAccessKey = localStorage.getItem('agent_access_key') || '';
     if (finalAccessKey) {
         setSuccessUI(finalAccessKey);
@@ -130,7 +130,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 throw new Error(errData.detail || '验证失败');
             }
             
-            // Save mode
+            // 验证成功后进入已保存状态
             setSuccessUI(val);
         } catch(error) {
             saveKeyBtn.innerHTML = prevText;
@@ -147,18 +147,18 @@ document.addEventListener('DOMContentLoaded', () => {
 
     saveKeyBtn.addEventListener('click', validateAccessCode);
     
-    // Auto validate on Enter or Blur
+    // 在回车或失焦时自动校验
     accessCodeInput.addEventListener('keypress', (e) => {
         if(e.key === 'Enter') validateAccessCode();
     });
     
-    // Prevent togglePwdBtn from stealing focus on click
+    // 防止点击密码切换按钮时抢走输入框焦点
     togglePwdBtn.addEventListener('mousedown', (e) => {
         e.preventDefault();
     });
 
     accessCodeInput.addEventListener('blur', () => {
-        // Delay blur to allow save-key-btn click without immediately alerting block
+        // 延迟处理 blur，给保存按钮点击留出时间，避免立刻触发拦截提示
         setTimeout(() => {
             if(document.activeElement !== saveKeyBtn && document.activeElement !== togglePwdBtn && accessCodeInput.value.trim() && !verifiedBadge.classList.contains('flex')) {
                 validateAccessCode();
@@ -166,7 +166,7 @@ document.addEventListener('DOMContentLoaded', () => {
         }, 100);
     });
 
-    // Handle quick pills (Persistent)
+    // 处理常驻快捷问题按钮
     quickPills.forEach(pill => {
         pill.addEventListener('click', (e) => {
             if (isRequestLocked) return;
@@ -180,7 +180,7 @@ document.addEventListener('DOMContentLoaded', () => {
         return remaining <= AUTO_SCROLL_THRESHOLD_PX;
     };
 
-    // Helper: Scroll to bottom only when the user is still following the stream.
+    // 辅助函数：只有用户仍在跟随流式输出时才自动滚到底部
     const scrollToBottom = (force = false) => {
         if (!force && !shouldStickToBottom) {
             return;
@@ -192,7 +192,7 @@ document.addEventListener('DOMContentLoaded', () => {
         shouldStickToBottom = isNearBottom();
     });
 
-    // Helper: Escape HTML
+    // 辅助函数：转义 HTML
     const escapeHTML = (str) => {
         return str.replace(/[&<>'"]/g, 
             tag => ({
@@ -205,9 +205,9 @@ document.addEventListener('DOMContentLoaded', () => {
         );
     };
 
-    // Helper: Format Server Response using marked.js
+    // 辅助函数：使用 marked.js 格式化服务端返回文本
     const formatText = (text) => {
-        // use marked if available, fallback to simple formatting
+        // 若可用则优先使用 marked，否则退回简单格式化
         if (typeof marked !== 'undefined') {
             return marked.parse(text);
         }
@@ -270,9 +270,9 @@ document.addEventListener('DOMContentLoaded', () => {
         return BADGE_CONFIG[labelKey] || BADGE_CONFIG.rag_full_research;
     };
 
-    // Pull authoritative badge text from the server so /labels is the single source of
-    // truth. CSS classes stay client-side because they are presentation. If the request
-    // fails we silently keep the local defaults baked into BADGE_CONFIG.
+    // 从服务端拉取权威 badge 文案，让 /labels 成为单一真源。
+    // CSS class 仍然留在客户端，因为那属于呈现层；
+    // 如果请求失败，就静默保留 BADGE_CONFIG 里的本地默认值。
     const ICON_PREFIX_RE = /^([^\w\u4e00-\u9fa5]+\s*)/;
     const syncBadgeTextFromServer = async () => {
         try {
@@ -288,7 +288,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 BADGE_CONFIG[key] = { ...BADGE_CONFIG[key], text: iconPrefix + text };
             });
         } catch (_err) {
-            // Network glitch → keep local fallback text.
+            // 网络抖动时保留本地兜底文案。
         }
     };
     syncBadgeTextFromServer();
@@ -322,7 +322,7 @@ document.addEventListener('DOMContentLoaded', () => {
         '</div>';
     };
 
-    // Helper: Create User Message Element
+    // 辅助函数：创建用户消息节点
     const appendUserMessage = (text) => {
         const msgDiv = document.createElement('div');
         msgDiv.className = 'flex w-full mt-4 space-x-4 max-w-2xl ml-auto justify-end group transition-colors duration-300';
@@ -347,7 +347,7 @@ document.addEventListener('DOMContentLoaded', () => {
         scrollToBottom(true);
     };
 
-    // Helper: Create Bot Message Element
+    // 辅助函数：创建机器人消息节点
     const buildBadgeHtml = (meta = {}) => {
         const latency = meta.latency_ms ?? meta.latency ?? null;
         if (!latency) return '';
@@ -462,7 +462,7 @@ document.addEventListener('DOMContentLoaded', () => {
         scrollToBottom();
     };
 
-    // Helper: Create Error Message Element with Retry
+    // 辅助函数：创建带重试按钮的错误消息节点
     const appendErrorMessage = (message, failedQuery) => {
         const msgDiv = document.createElement('div');
         msgDiv.className = 'flex w-full mt-4 space-x-4 max-w-2xl transition-colors duration-300';
@@ -484,7 +484,7 @@ document.addEventListener('DOMContentLoaded', () => {
         scrollToBottom();
     };
 
-    // Helper: Create Loading Indicator
+    // 辅助函数：创建加载指示器
     const createLoadingIndicator = () => {
         const id = 'loader-' + Date.now();
         const msgDiv = document.createElement('div');
@@ -534,7 +534,7 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     };
 
-    // Retry global binding
+    // 全局重试绑定
     window.lastAttemptedQuery = "";
     window.retryLastRequest = (btnElement) => {
         if (isRequestLocked) return;
@@ -624,7 +624,7 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     };
 
-    // Action: Handle Send
+    // 核心动作：处理发送请求
     const handleSend = async (overrideText = null, isRetry = false, retryIntoMessage = null) => {
         const query = typeof overrideText === 'string' ? overrideText : userInput.value.trim();
         const accessCode = finalAccessKey || accessCodeInput.value.trim();
@@ -659,7 +659,7 @@ document.addEventListener('DOMContentLoaded', () => {
         }
 
         try {
-            window.lastAttemptedQuery = query; // Save for retry even when backend is not ready yet
+            window.lastAttemptedQuery = query; // 即使后端尚未就绪，也先保留本次问题以便重试
 
             const readiness = await ensureBackendReady();
             if (!readiness.ok) {
@@ -667,7 +667,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 return;
             }
 
-            // Add user msg if not retrying
+              // 如果不是重试，就先追加用户消息气泡
             if(!isRetry) {
                  appendUserMessage(query);
             }
@@ -676,12 +676,12 @@ document.addEventListener('DOMContentLoaded', () => {
                 userInput.value = '';
             }
             
-            // Show loader (skip for in-place retry—existing bubble already shows loading state)
+            // 显示加载态；原地重试时跳过，因为旧气泡已经在显示加载状态
             if (!retryIntoMessage) {
                 requestState.loaderId = createLoadingIndicator();
             }
 
-            // Request backend
+            // 向后端发起请求
             const response = await fetch(CHAT_API_URL, {
                 method: 'POST',
                 headers: {
@@ -760,7 +760,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 requestState.loaderId = null;
             }
             
-            // Clear last attempt on success
+            // 成功后清空最近一次失败请求记录
             window.lastAttemptedQuery = "";
 
         } catch (error) {
@@ -774,7 +774,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 const streamMessage = ensureStreamingMessage(requestState);
                 markStreamingMessageStopped(streamMessage, requestState.query);
             } else {
-                // Render specific retry UI
+                // 渲染具体的重试界面
                 if(error.message === 'Failed to fetch') {
                      appendErrorMessage("网络请求失败，后端服务可能未启动或网络异常。", query);
                 } else {
@@ -794,7 +794,7 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     };
 
-    // Listeners
+    // 事件监听绑定
     sendBtn.addEventListener('click', () => handleSend());
     composerStopBtn.addEventListener('click', () => window.stopCurrentResponse(composerStopBtn));
     userInput.addEventListener('keypress', (e) => {

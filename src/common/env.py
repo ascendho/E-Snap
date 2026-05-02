@@ -15,16 +15,21 @@ def load_env():
 load_env()
 
 # ==========================================
-# 全局配置 (Single Source of Truth)
+# 全局配置（单一真源）
 # ==========================================
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 CACHE_NAME = os.getenv("CACHE_NAME", "semantic-cache")
 
 # 当前实现采用逻辑两级缓存：
-# - L1: exact fast path（归一化后的字符串精确命中）
+# - L1: 进程内快速路径（归一化后的字符串精确命中、near_exact、edit_distance）
 # - L2: semantic cache（当前仍由 RedisVL 承载）
+# 这不是“L1 单独向量库 + L2 单独键值库”的双库结构，
+# 而是同一套运行时中的逻辑双层封装。
 CACHE_L1_EXACT_ENABLED = os.getenv("CACHE_L1_EXACT_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 CACHE_L1_EDIT_DISTANCE_ENABLED = os.getenv("CACHE_L1_EDIT_DISTANCE_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+# 默认保持 1 作为安全基线：
+# - 1 足以兜住轻微 typo / OCR 噪声
+# - 更大的阈值更容易把不同中文商品问法误判成同题
 CACHE_L1_EDIT_DISTANCE_MAX_DISTANCE = int(os.getenv("CACHE_L1_EDIT_DISTANCE_MAX_DISTANCE", "1"))
 CACHE_L2_DISTANCE_THRESHOLD = float(os.getenv("CACHE_L2_DISTANCE_THRESHOLD", os.getenv("CACHE_DISTANCE_THRESHOLD", "0.2")))
 

@@ -4,14 +4,14 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>E-Snap</title>
-    <!-- Favicon -->
+    <!-- 网站图标 -->
     <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%234F46E5' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z'/%3E%3C/svg%3E">
     <link rel="shortcut icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%234F46E5' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z'/%3E%3C/svg%3E">
     <link rel="apple-touch-icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%234F46E5' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z'/%3E%3C/svg%3E">
     <link rel="apple-touch-icon-precomposed" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%234F46E5' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z'/%3E%3C/svg%3E">
-    <!-- Google Fonts & Tailwind -->
+    <!-- 字体与 Tailwind 资源 -->
     <script src="https://cdn.tailwindcss.com"></script>
-    <!-- Markdown Parser -->
+    <!-- Markdown 解析器 -->
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <script>
         tailwind.config = {
@@ -37,7 +37,7 @@
         .animation-delay-2000 { animation-delay: 2s; }
         .animation-delay-4000 { animation-delay: 4s; }
         
-        /* Markdown Styles */
+        /* Markdown 样式 */
         .markdown-content h1, .markdown-content h2, .markdown-content h3 {
             font-weight: 600;
             margin-top: 1em;
@@ -61,20 +61,20 @@
     <link rel="stylesheet" href="styles.css?v=20260501-inplace-retry">
 </head>
 <body class="bg-gray-50 dark:bg-gray-900 font-sans h-screen flex items-center justify-center antialiased text-gray-800 dark:text-gray-200 p-2 sm:p-6 overflow-hidden relative transition-colors duration-300">
-    <!-- Animated Background Blobs -->
+    <!-- 背景动画光斑 -->
     <div class="absolute top-0 -left-4 w-72 h-72 bg-purple-400 rounded-full filter blur-[100px] opacity-50 animate-blob dark:bg-purple-600 dark:opacity-30 pointer-events-none"></div>
     <div class="absolute top-0 -right-4 w-72 h-72 bg-yellow-300 rounded-full filter blur-[100px] opacity-50 animate-blob animation-delay-2000 dark:bg-yellow-600 dark:opacity-30 pointer-events-none"></div>
     <div class="absolute -bottom-8 left-20 w-72 h-72 bg-pink-400 rounded-full filter blur-[100px] opacity-50 animate-blob animation-delay-4000 dark:bg-pink-600 dark:opacity-30 pointer-events-none"></div>
 
-    <!-- Card Container -->
+    <!-- 卡片容器 -->
     <div class="w-full max-w-7xl h-full max-h-[900px] bg-[#f8f9fa] dark:bg-gray-800 rounded-2xl shadow-2xl overflow-hidden flex flex-col relative border border-gray-200/50 dark:border-gray-700 backdrop-blur-sm transition-colors duration-300 z-10">
-        <!-- Header -->
+        <!-- 顶部栏 -->
         <header class="bg-white/80 dark:bg-gray-800/80 backdrop-blur-md shadow-sm border-b border-gray-100 dark:border-gray-700 z-20 relative shrink-0 transition-colors duration-300">
         <div class="max-w-7xl mx-auto px-6 py-4 flex items-center justify-between">
             <h1 class="text-xl font-semibold tracking-tight text-gray-900 dark:text-white">E-Snap</h1>
             <div class="flex items-center space-x-3">
                 
-                <!-- Access Code Controls Container -->
+                <!-- 访问码控件容器 -->
                 <div id="access-container" class="flex items-center space-x-2">
                     <div id="access-input-wrapper" class="flex items-center space-x-2 bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-600 rounded-lg pr-1 pl-3 py-1.5 shadow-sm transition-colors focus-within:ring-2 focus-within:ring-black/5 dark:focus-within:ring-white/10">
                         <span class="text-xs font-medium text-gray-400 uppercase tracking-wider select-none">Access</span>
@@ -93,16 +93,16 @@
                     </button>
                 </div>
                 
-                <!-- Verified Badge (Hidden initially) -->
+                <!-- 已验证徽标（初始隐藏） -->
                 <div id="verified-badge" class="hidden items-center justify-center bg-green-50 dark:bg-green-500/10 text-green-700 dark:text-green-400 rounded-lg px-3 py-1.5 text-sm font-medium border border-green-200 dark:border-green-500/20 cursor-pointer shadow-sm transition-all hover:bg-green-100 dark:hover:bg-green-500/20" title="点击修改验证码">
                     ✅ <span class="ml-1">已授权</span>
                 </div>
 
-                <!-- Theme Toggle Button -->
+                <!-- 主题切换按钮 -->
                 <button id="theme-toggle-btn" class="ml-2 w-10 h-10 flex items-center justify-center text-gray-500 hover:text-gray-900 dark:text-gray-400 dark:hover:text-white bg-gray-100 dark:bg-gray-700 rounded-full hover:bg-gray-200 dark:hover:bg-gray-600 transition-colors focus:outline-none shadow-sm border border-gray-200 dark:border-gray-600">
-                    <!-- Sun Icon (hidden in base/light mode) -->
+                    <!-- 太阳图标（默认浅色模式下隐藏） -->
                     <svg id="theme-toggle-light-icon" class="hidden w-5 h-5" fill="currentColor" viewBox="0 0 20 20" xmlns="http://www.w3.org/2000/svg"><path fill-rule="evenodd" d="M10 2a1 1 0 011 1v1a1 1 0 11-2 0V3a1 1 0 011-1zm4.22 2.32a1 1 0 011.415 0l.707.708a1 1 0 01-1.414 1.414l-.708-.707a1 1 0 010-1.415zM18 10a1 1 0 01-1 1h-1a1 1 0 110-2h1a1 1 0 011 1zm-4.78 6.46a1 1 0 010 1.415l-.707.707a1 1 0 01-1.414-1.414l.707-.708a1 1 0 011.414 0zM10 18a1 1 0 01-1-1v-1a1 1 0 112 0v1a1 1 0 01-1 1zm-6.46-4.78a1 1 0 01-1.415 0l-.707-.707a1 1 0 011.414-1.414l.708.707a1 1 0 010 1.415zM3 10a1 1 0 011-1h1a1 1 0 110 2H4a1 1 0 01-1-1zm2.32-4.22a1 1 0 010-1.415l.707-.708a1 1 0 011.414 1.414l-.708.707a1 1 0 01-1.415 0zM10 14a4 4 0 100-8 4 4 0 000 8z" clip-rule="evenodd"></path></svg>
-                    <!-- Moon Icon (hidden in dark mode) -->
+                    <!-- 月亮图标（深色模式下隐藏） -->
                     <svg id="theme-toggle-dark-icon" class="hidden w-5 h-5" fill="currentColor" viewBox="0 0 20 20" xmlns="http://www.w3.org/2000/svg"><path d="M17.293 13.293A8 8 0 016.707 2.707a8.001 8.001 0 1010.586 10.586z"></path></svg>
                 </button>
 
@@ -110,10 +110,10 @@
         </div>
     </header>
 
-    <!-- Chat Container -->
+    <!-- 聊天容器 -->
     <main class="flex-1 max-w-7xl mx-auto w-full flex flex-col pt-4 overflow-hidden relative pb-44">
         <div id="chat-box" class="flex-1 overflow-y-auto px-6 pb-6 space-y-6">
-            <!-- Initial Bot Message -->
+            <!-- 初始机器人欢迎消息 -->
             <div class="flex w-full mt-2 space-x-4 max-w-2xl">
                 <div class="flex-shrink-0 mt-1 h-9 w-9 rounded-full bg-gradient-to-tr from-indigo-500 to-purple-600 flex items-center justify-center shadow-md">
                     <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-5 h-5 text-white">
@@ -128,10 +128,10 @@
             </div>
         </div>
 
-        <!-- Input Area Fixed Bottom -->
+        <!-- 固定在底部的输入区 -->
         <div class="absolute bottom-0 w-full bg-gradient-to-t from-[#f8f9fa] via-[#f8f9fa] to-transparent dark:from-gray-800 dark:via-gray-800 dark:to-transparent pt-8 pb-6 px-4 transition-colors duration-300 pointer-events-none">
             <div class="max-w-7xl mx-auto flex flex-col items-center pointer-events-auto">
-                <!-- Persistent Quick Action Pills -->
+                <!-- 常驻快捷问题按钮 -->
                 <div class="flex w-full space-x-3 flex-wrap gap-y-3 mb-5 justify-center" id="quick-actions">
                     <button class="quick-pill bg-white/60 dark:bg-gray-800/50 backdrop-blur-md text-gray-700 dark:text-gray-300 hover:text-indigo-600 dark:hover:text-indigo-400 text-[13px] px-5 py-2.5 rounded-2xl transition-all duration-300 shadow-[0_2px_12px_-4px_rgba(0,0,0,0.08)] dark:shadow-[0_2px_12px_-4px_rgba(0,0,0,0.3)] hover:shadow-[0_8px_20px_-6px_rgba(79,70,229,0.15)] dark:hover:shadow-[0_8px_20px_-6px_rgba(99,102,241,0.2)] hover:-translate-y-0.5 focus:outline-none font-medium flex items-center space-x-1.5 border border-white/40 dark:border-white/5">
                         <span>📦</span><span>你们支持几天无理由退换？</span>

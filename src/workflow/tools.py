@@ -35,7 +35,7 @@ def initialize_tools(
     但在生产环境下，Redis 连接和模型加载通常在主程序启动时完成，
     因此我们通过此函数将这些“重型资源”动态注入到本工具模块中。
 
-    Args:
+    参数：
         knowledge_base_index: 已连接并配置好的 RedisVL SearchIndex 实例。
         openai_embeddings: 已加载权重的向量化模型实例（如 BGE 或 OpenAI Embedding）。
     """
@@ -55,11 +55,11 @@ def search_knowledge_base(query: str, top_k: int = 3) -> str:
     智能体在发现自己无法直接回答问题时，会自发决定调用此函数，
     将“原始查询”转化为“语义向量”，并在 Redis 毫秒级返回最匹配的知识。
 
-    Args:
+    参数：
         query: 用户的问题或需要检索的关键词。
         top_k: 指定返回最相关的文本块数量，默认取前 3 条以平衡信息量与 Token 消耗。
 
-    Returns:
+    返回：
         一段格式化的字符串，包含检索到的文本内容、层级标题及其相关度分数。
 
     这不是“直接给用户展示的最终答案”，而是给 research prompt 消费的检索上下文。
@@ -67,6 +67,11 @@ def search_knowledge_base(query: str, top_k: int = 3) -> str:
     - Vector KNN 负责语义召回
     - BM25 负责字面强匹配
     - 然后做交叉去重合并，给后续 LLM 一个覆盖面更稳的上下文集合
+
+    这里的 Vector KNN 指的是“按向量最近邻来找候选结果”的检索形式；
+    真正让 Redis 高效执行这类近邻检索的底层索引结构，
+    则在 knowledge/indexer.py 里配置为 HNSW。
+    也就是说：KNN 是要做什么，HNSW 是底层怎么更快地做这件事。
     """
     # 【安全性检查】：确保资源已注入。如果未初始化直接调用，返回提示而非让系统崩溃。
     if not kb_index or not embeddings:
@@ -87,7 +92,7 @@ def search_knowledge_base(query: str, top_k: int = 3) -> str:
         # - 向量检索负责召回“意思接近”的内容
         # - BM25 负责抓商品名、规则原文、专有词等字面强匹配
         # 对客服知识库来说，这种混合检索通常比只做单一路径更稳。
-        # 1. 向量相似度查询 (语义搜索)
+        # 1. 向量相似度查询（语义搜索）
         vec_query = VectorQuery(
             vector=query_vector,           # 搜索的“靶向”向量
             vector_field_name="content_vector", # Redis 中存储向量的字段名，需与 Indexer 配置一致
@@ -102,10 +107,11 @@ def search_knowledge_base(query: str, top_k: int = 3) -> str:
             num_results=top_k,             # 限制返回的结果条数
         )
 
-        # 执行查询：在 Redis 的 HNSW 索引空间中进行快速最近邻向量搜索
+        # 执行查询：逻辑上这是一次 KNN 最近邻搜索；
+        # 物理上 Redis 会借助 HNSW 这个 ANN 索引结构来加速完成。
         vec_results = kb_index.query(vec_query)
         
-        # 2. 文本词频匹配 (BM25) 查询 (字面搜索)
+        # 2. 文本词频匹配（BM25）查询（字面搜索）
         txt_results = []
         try:
             from redisvl.query import FilterQuery
@@ -145,7 +151,8 @@ def search_knowledge_base(query: str, top_k: int = 3) -> str:
             if i < len(txt_results):
                 cnt = txt_results[i].get("content")
                 if cnt not in seen_content:
-                    # 对于纯文本命中的项，为了规避距离没有返回，我们可以赋一个初始中等置信度的 dummy 虚拟距离
+                    # 对于纯文本命中的项，为了规避距离没有返回，
+                    # 这里人为补一个中等置信度的占位距离，便于后续统一格式化。
                     if "vector_distance" not in txt_results[i]:
                         txt_results[i]["vector_distance"] = 0.25 
                     merged_results.append(txt_results[i])

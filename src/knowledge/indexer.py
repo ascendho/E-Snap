@@ -97,7 +97,10 @@ class KnowledgeBaseManager:
                 return False, f"Unsupported content type: {type(content)}. Expected a list of chunks.", None
             
             # --- 步骤 2: 定义 Redis 向量索引 Schema（结构） ---
-            # 该结构决定了数据如何在 Redis 中存储以及哪些字段可以被检索
+            # 该结构决定了数据如何在 Redis 中存储以及哪些字段可以被检索。
+            # 这和 cache/engine.py 里的 L2 semantic cache 共用同一个物理 Redis，
+            # 但逻辑上是另一套独立索引：这里存的是知识库文档切块及其元数据，
+            # 不是 FAQ 问答缓存本身。
             schema = {
                 "index": {
                     "name": index_name,                # 索引名称
@@ -118,7 +121,7 @@ class KnowledgeBaseManager:
                         "attrs": {
                             "dims": 1024,                         # 维度：必须与 bge-large-zh 模型一致
                             "distance_metric": "cosine",         # 度量：使用余弦相似度计算相关性
-                            "algorithm": "hnsw",                 # 算法：HNSW 是一种高效的近似最近邻搜索算法
+                            "algorithm": "hnsw",                 # 算法：HNSW 是 Redis 底层使用的 ANN 索引结构，用来加速上层的 KNN 检索
                             "datatype": "float32",                # 浮点数存储
                         },
                     },
@@ -127,7 +130,7 @@ class KnowledgeBaseManager:
             
             # --- 步骤 3: 在 Redis 中创建并初始化索引 ---
             kb_index = SearchIndex.from_dict(schema, redis_client=self.redis_client)
-            # overwrite=True：如果已存在同名索引，则先删除再创建，确保数据最新
+            # `overwrite=True`：如果已存在同名索引，则先删除再创建，确保数据最新
             kb_index.create(overwrite=True)
             
             # --- 步骤 4: 并行向量化（Embedding）并封装 Payload ---
@@ -151,7 +154,7 @@ class KnowledgeBaseManager:
                         "header_1": str(metadata.get("header_1", "") or ""),
                         "header_2": str(metadata.get("header_2", "") or ""),
                         "header_3": str(metadata.get("header_3", "") or ""),
-                        # RedisVL 对 bool 处理较严格，此处转为字符串 tag
+                        # RedisVL 对布尔值处理较严格，这里转成字符串标签字段
                         "is_announcement": "true" if bool(metadata.get("is_announcement", False)) else "false",
                         "chunk_index": i,
                         "content_vector": embedding,
