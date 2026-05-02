@@ -45,22 +45,46 @@ def _make_fake_wrapper():
     fake._answer_by_question = {}
     fake._normalized_question_map = {}
     fake._near_exact_question_map = {}
+    fake._stored_normalized_question_map = {}
+    fake._stored_near_exact_question_map = {}
+    fake._pinned_l1_questions = set()
+    fake._semantic_hit_counts = {}
+    fake._l1_promotion_enabled = True
+    fake._l1_promotion_threshold = 2
+    fake._l1_max_entries = 128
+    fake.semantic_results = []
 
     captured_writes = []
 
     class _FakeCache:
-        @staticmethod
-        def store(prompt, response):
+        def __init__(self, owner):
+            self.owner = owner
+
+        def store(self, prompt, response):
             captured_writes.append((prompt, response))
 
-    fake.cache = _FakeCache()
+        def check(self, query, distance_threshold=None, num_results=1):
+            return list(self.owner.semantic_results)
+
+        @staticmethod
+        def clear():
+            return None
+
+    fake.cache = _FakeCache(fake)
     fake.captured_writes = captured_writes
 
     # Bind the unbound methods.
     fake.normalize_query = SemanticCacheWrapper.normalize_query
     fake.normalize_surface_query = SemanticCacheWrapper.normalize_surface_query
+    fake.split_query_segments = SemanticCacheWrapper.split_query_segments
+    fake._levenshtein_distance_with_limit = SemanticCacheWrapper._levenshtein_distance_with_limit
+    fake.find_subquery_candidate = SemanticCacheWrapper.find_subquery_candidate.__get__(fake)
+    fake.find_edit_distance_candidate = SemanticCacheWrapper.find_edit_distance_candidate.__get__(fake)
     fake.register_entry = SemanticCacheWrapper.register_entry.__get__(fake)
+    fake.store_runtime_entry = SemanticCacheWrapper.store_runtime_entry.__get__(fake)
     fake.contains_prompt_variant = SemanticCacheWrapper.contains_prompt_variant.__get__(fake)
+    fake.check = SemanticCacheWrapper.check.__get__(fake)
+    fake.get_l1_stats = SemanticCacheWrapper.get_l1_stats.__get__(fake)
     return fake
 
 
@@ -99,6 +123,71 @@ class ContainsPromptVariantTests(unittest.TestCase):
         wrapper = _make_fake_wrapper()
         wrapper.register_entry("Refund policy", "...")
         self.assertFalse(wrapper.contains_prompt_variant("shipping speed"))
+
+
+class RuntimePromotionTests(unittest.TestCase):
+    def test_runtime_entry_stays_out_of_l1_until_it_becomes_hot(self):
+        wrapper = _make_fake_wrapper()
+
+        wrapper.store_runtime_entry("Refund timeline", "Refunds usually arrive in 7 days.")
+
+        self.assertEqual(wrapper._answer_by_question, {})
+        self.assertTrue(wrapper.contains_prompt_variant("refund   timeline"))
+        self.assertEqual(
+            wrapper.captured_writes,
+            [("Refund timeline", "Refunds usually arrive in 7 days.")],
+        )
+
+    def test_semantic_hits_promote_runtime_entry_after_threshold(self):
+        wrapper = _make_fake_wrapper()
+        wrapper._l1_promotion_threshold = 2
+        wrapper.store_runtime_entry("Refund timeline", "Refunds usually arrive in 7 days.")
+        wrapper.semantic_results = [{
+            "prompt": "Refund timeline",
+            "response": "Refunds usually arrive in 7 days.",
+            "vector_distance": 0.1,
+        }]
+
+        wrapper.check("When will my refund arrive?")
+        self.assertNotIn("Refund timeline", wrapper._answer_by_question)
+
+        wrapper.check("How long does a refund take?")
+
+        self.assertEqual(
+            wrapper._answer_by_question["Refund timeline"],
+            "Refunds usually arrive in 7 days.",
+        )
+        self.assertEqual(wrapper.get_l1_stats()["promoted_entries"], 1)
+        self.assertEqual(wrapper.get_l1_stats()["promotion_count"], 1)
+
+    def test_lru_evicts_only_runtime_promotions_and_keeps_pinned_faq(self):
+        wrapper = _make_fake_wrapper()
+        wrapper._l1_promotion_threshold = 1
+        wrapper._l1_max_entries = 2
+        wrapper.register_entry("How to ship?", "Use SF Express", seed_id=42)
+
+        wrapper.store_runtime_entry("Refund timeline", "Refunds usually arrive in 7 days.")
+        wrapper.semantic_results = [{
+            "prompt": "Refund timeline",
+            "response": "Refunds usually arrive in 7 days.",
+            "vector_distance": 0.1,
+        }]
+        wrapper.check("When will my refund arrive?")
+        self.assertIn("Refund timeline", wrapper._answer_by_question)
+
+        wrapper.store_runtime_entry("Overseas shipping", "We support overseas delivery.")
+        wrapper.semantic_results = [{
+            "prompt": "Overseas shipping",
+            "response": "We support overseas delivery.",
+            "vector_distance": 0.1,
+        }]
+        wrapper.check("Do you ship abroad?")
+
+        self.assertIn("How to ship?", wrapper._answer_by_question)
+        self.assertNotIn("Refund timeline", wrapper._answer_by_question)
+        self.assertIn("Overseas shipping", wrapper._answer_by_question)
+        self.assertTrue(wrapper.contains_prompt_variant("refund timeline"))
+        self.assertEqual(wrapper.get_l1_stats()["eviction_count"], 1)
 
 
 if __name__ == "__main__":

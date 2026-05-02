@@ -1,4 +1,5 @@
-from typing import Dict, List, Optional
+from collections import OrderedDict
+from typing import Dict, List, Optional, Set
 import redis
 import unicodedata
 from pydantic import BaseModel
@@ -12,6 +13,9 @@ from common.env import (
     CACHE_L1_EXACT_ENABLED,
     CACHE_L1_EDIT_DISTANCE_ENABLED,
     CACHE_L1_EDIT_DISTANCE_MAX_DISTANCE,
+    CACHE_L1_MAX_ENTRIES,
+    CACHE_L1_PROMOTION_ENABLED,
+    CACHE_L1_PROMOTION_THRESHOLD,
 )
 
 class CacheResult(BaseModel):
@@ -81,7 +85,7 @@ class SemanticCacheWrapper:
             redis_client=self.redis, 
             distance_threshold=CACHE_DISTANCE_THRESHOLD
         )
-        self._seed_id_by_question: Dict[str, int] = {}
+        self._seed_id_by_question: Dict[str, Optional[int]] = {}
         self._answer_by_question: Dict[str, str] = {}
         # L1 快速路径的两个映射表都是“归一化后的 query -> 原问题文本”，
         # 而不是“归一化后的 query -> 答案”。
@@ -91,6 +95,170 @@ class SemanticCacheWrapper:
         # 1) 快速查找；2) 保留原始问句；3) 让 seed_id / answer / prompt 三者保持同一主键。
         self._normalized_question_map: Dict[str, str] = {}
         self._near_exact_question_map: Dict[str, str] = {}
+        # 这两张 registry map 记录“所有已登记到 L2 的 prompt 变体”，
+        # 不管该条问答当前是否已经进入 L1。
+        # 典型例子：
+        # - FAQ seed: “你们支持几天无理由退换？” 会同时进入 registry 和 L1
+        # - 运行时问答: “退货时的物流费用怎么算？” 第一次只进入 registry + L2，不会立刻进 L1
+        self._stored_normalized_question_map: Dict[str, str] = {}
+        self._stored_near_exact_question_map: Dict[str, str] = {}
+        # pinned 集合保存 FAQ seed 等“必须常驻”的 L1 项；
+        # promoted 有序字典只保存可淘汰的运行时热点项，用于 LRU。
+        self._pinned_l1_questions: Set[str] = set()
+        self._promoted_l1_questions: OrderedDict[str, None] = OrderedDict()
+        self._semantic_hit_counts: Dict[str, int] = {}
+        self._l1_promotion_enabled = CACHE_L1_PROMOTION_ENABLED
+        self._l1_promotion_threshold = CACHE_L1_PROMOTION_THRESHOLD
+        self._l1_max_entries = CACHE_L1_MAX_ENTRIES
+        self._l1_promotion_count = 0
+        self._l1_eviction_count = 0
+        self._l1_promotion_skipped_capacity = 0
+
+    @staticmethod
+    def _ensure_runtime_state(instance) -> None:
+        if not hasattr(instance, "_seed_id_by_question"):
+            instance._seed_id_by_question = {}
+        if not hasattr(instance, "_answer_by_question"):
+            instance._answer_by_question = {}
+        if not hasattr(instance, "_normalized_question_map"):
+            instance._normalized_question_map = {}
+        if not hasattr(instance, "_near_exact_question_map"):
+            instance._near_exact_question_map = {}
+        if not hasattr(instance, "_stored_normalized_question_map"):
+            instance._stored_normalized_question_map = {}
+        if not hasattr(instance, "_stored_near_exact_question_map"):
+            instance._stored_near_exact_question_map = {}
+        if not hasattr(instance, "_pinned_l1_questions"):
+            instance._pinned_l1_questions = set()
+        if not hasattr(instance, "_promoted_l1_questions"):
+            instance._promoted_l1_questions = OrderedDict()
+        if not hasattr(instance, "_semantic_hit_counts"):
+            instance._semantic_hit_counts = {}
+        if not hasattr(instance, "_l1_promotion_enabled"):
+            instance._l1_promotion_enabled = CACHE_L1_PROMOTION_ENABLED
+        if not hasattr(instance, "_l1_promotion_threshold"):
+            instance._l1_promotion_threshold = CACHE_L1_PROMOTION_THRESHOLD
+        if not hasattr(instance, "_l1_max_entries"):
+            instance._l1_max_entries = CACHE_L1_MAX_ENTRIES
+        if not hasattr(instance, "_l1_promotion_count"):
+            instance._l1_promotion_count = 0
+        if not hasattr(instance, "_l1_eviction_count"):
+            instance._l1_eviction_count = 0
+        if not hasattr(instance, "_l1_promotion_skipped_capacity"):
+            instance._l1_promotion_skipped_capacity = 0
+
+    @staticmethod
+    def _register_prompt_in_registry(instance, prompt: str) -> None:
+        SemanticCacheWrapper._ensure_runtime_state(instance)
+        normalized_prompt = SemanticCacheWrapper.normalize_query(prompt)
+        normalized_surface_prompt = SemanticCacheWrapper.normalize_surface_query(prompt)
+        instance._stored_normalized_question_map[normalized_prompt] = prompt
+        instance._stored_near_exact_question_map[normalized_surface_prompt] = prompt
+
+    @staticmethod
+    def _touch_l1_prompt(instance, prompt: str) -> None:
+        SemanticCacheWrapper._ensure_runtime_state(instance)
+        if prompt in instance._promoted_l1_questions:
+            instance._promoted_l1_questions.move_to_end(prompt)
+
+    @staticmethod
+    def _remove_l1_prompt(instance, prompt: str) -> None:
+        SemanticCacheWrapper._ensure_runtime_state(instance)
+        instance._seed_id_by_question.pop(prompt, None)
+        instance._answer_by_question.pop(prompt, None)
+        normalized_prompt = SemanticCacheWrapper.normalize_query(prompt)
+        if instance._normalized_question_map.get(normalized_prompt) == prompt:
+            instance._normalized_question_map.pop(normalized_prompt, None)
+        normalized_surface_prompt = SemanticCacheWrapper.normalize_surface_query(prompt)
+        if instance._near_exact_question_map.get(normalized_surface_prompt) == prompt:
+            instance._near_exact_question_map.pop(normalized_surface_prompt, None)
+        instance._promoted_l1_questions.pop(prompt, None)
+
+    @staticmethod
+    def _upsert_l1_prompt(
+        instance,
+        prompt: str,
+        answer: str,
+        seed_id: Optional[int] = None,
+        *,
+        pinned: bool = False,
+    ) -> bool:
+        SemanticCacheWrapper._ensure_runtime_state(instance)
+
+        effective_pinned = pinned or prompt in instance._pinned_l1_questions
+        if effective_pinned:
+            instance._pinned_l1_questions.add(prompt)
+            instance._promoted_l1_questions.pop(prompt, None)
+        else:
+            promoted_budget = max(instance._l1_max_entries - len(instance._pinned_l1_questions), 0)
+            if prompt not in instance._promoted_l1_questions:
+                if promoted_budget <= 0:
+                    instance._l1_promotion_skipped_capacity += 1
+                    return False
+                while len(instance._promoted_l1_questions) >= promoted_budget:
+                    evicted_prompt, _ = instance._promoted_l1_questions.popitem(last=False)
+                    SemanticCacheWrapper._remove_l1_prompt(instance, evicted_prompt)
+                    instance._l1_eviction_count += 1
+                instance._promoted_l1_questions[prompt] = None
+            else:
+                instance._promoted_l1_questions.move_to_end(prompt)
+
+        instance._seed_id_by_question[prompt] = seed_id
+        instance._answer_by_question[prompt] = answer
+        instance._normalized_question_map[SemanticCacheWrapper.normalize_query(prompt)] = prompt
+        instance._near_exact_question_map[SemanticCacheWrapper.normalize_surface_query(prompt)] = prompt
+        return True
+
+    @staticmethod
+    def _record_semantic_hit(instance, prompt: str, response: str, seed_id: Optional[int] = None) -> bool:
+        SemanticCacheWrapper._ensure_runtime_state(instance)
+
+        if prompt in instance._pinned_l1_questions:
+            return False
+        if prompt in instance._answer_by_question:
+            SemanticCacheWrapper._touch_l1_prompt(instance, prompt)
+            return False
+        if not instance._l1_promotion_enabled:
+            return False
+
+        hit_count = instance._semantic_hit_counts.get(prompt, 0) + 1
+        instance._semantic_hit_counts[prompt] = hit_count
+        if hit_count < max(instance._l1_promotion_threshold, 1):
+            return False
+
+        promoted = SemanticCacheWrapper._upsert_l1_prompt(
+            instance,
+            prompt,
+            response,
+            seed_id=seed_id,
+            pinned=False,
+        )
+        if promoted:
+            instance._l1_promotion_count += 1
+        return promoted
+
+    def store_runtime_entry(self, prompt: str, answer: str) -> None:
+        """把运行时问答先写入 L2 和 prompt registry，不立刻常驻 L1。
+
+        具体例子：
+        - FAQ seed “你们支持几天无理由退换？” 仍应走 `register_entry(..., seed_id=0)`，
+          同时写入 L2 和 pinned L1。
+        - 运行时新问答 “退货时的物流费用怎么算？” 第一次只进入 L2 和 registry；
+          只有后续被反复命中，才会由 `check()` 里的热点计数晋升到 L1。
+        """
+        self.register_entry(prompt, answer, populate_l1=False)
+
+    def get_l1_stats(self) -> Dict[str, int]:
+        """返回 L1 当前大小与晋升/淘汰计数，便于验证新策略是否生效。"""
+        SemanticCacheWrapper._ensure_runtime_state(self)
+        return {
+            "total_entries": len(self._answer_by_question),
+            "pinned_entries": len(self._pinned_l1_questions),
+            "promoted_entries": len(self._promoted_l1_questions),
+            "promotion_count": self._l1_promotion_count,
+            "eviction_count": self._l1_eviction_count,
+            "promotion_skipped_capacity": self._l1_promotion_skipped_capacity,
+        }
 
     @staticmethod
     def normalize_query(query: str) -> str:
@@ -161,6 +329,7 @@ class SemanticCacheWrapper:
             # 先用归一化后的子问题命中 L1 map，再拿原问题文本去 _answer_by_question 查答案。
             exact_match = self._normalized_question_map.get(normalized_segment)
             if exact_match:
+                SemanticCacheWrapper._touch_l1_prompt(self, exact_match)
                 print(f"⚡ [子问题命中] exact subquery hit: '{segment}' -> '{exact_match}'")
                 return CacheResult(
                     prompt=exact_match,
@@ -174,6 +343,7 @@ class SemanticCacheWrapper:
             near_exact_segment = self.normalize_surface_query(segment)
             near_exact_match = self._near_exact_question_map.get(near_exact_segment)
             if near_exact_match:
+                SemanticCacheWrapper._touch_l1_prompt(self, near_exact_match)
                 print(f"⚡ [子问题命中] near-exact subquery hit: '{segment}' -> '{near_exact_match}'")
                 return CacheResult(
                     prompt=near_exact_match,
@@ -264,6 +434,7 @@ class SemanticCacheWrapper:
         if best_match is None or best_distance is None:
             return None
 
+        SemanticCacheWrapper._touch_l1_prompt(self, best_match)
         print(f"⚡ [编辑距离命中] edit-distance hit: '{query}' -> '{best_match}' (distance={best_distance})")
         return CacheResult(
             prompt=best_match,
@@ -294,6 +465,14 @@ class SemanticCacheWrapper:
         self._answer_by_question = {}
         self._normalized_question_map = {}
         self._near_exact_question_map = {}
+        self._stored_normalized_question_map = {}
+        self._stored_near_exact_question_map = {}
+        self._pinned_l1_questions = set()
+        self._promoted_l1_questions = OrderedDict()
+        self._semantic_hit_counts = {}
+        self._l1_promotion_count = 0
+        self._l1_eviction_count = 0
+        self._l1_promotion_skipped_capacity = 0
 
     def store_batch(self, qa_pairs: List[Dict], clear: bool = True):
         """
@@ -305,50 +484,62 @@ class SemanticCacheWrapper:
         for item in qa_pairs:
             self.register_entry(item["question"], item["answer"], seed_id=item.get("id"))
 
-    def register_entry(self, prompt: str, answer: str, seed_id: Optional[int] = None) -> None:
-        """把 `(prompt, answer)` 写入缓存，并同步刷新所有 L1 查询 map。
+    def register_entry(
+        self,
+        prompt: str,
+        answer: str,
+        seed_id: Optional[int] = None,
+        *,
+        populate_l1: bool = True,
+    ) -> None:
+        """把 `(prompt, answer)` 写入缓存，并按策略决定是否进入 L1。
 
-        这是整个缓存系统的统一写入口：
-        - FAQ seed 预热时会走这里
-        - workflow 运行时写回缓存时也会走这里
-        - 后台子问题提取后的写回同样走这里
+        这里现在明确区分了两种写入语义：
+        - FAQ seed / 显式固定入口：`populate_l1=True`，写入 L2 + L1
+        - 运行时新问答：`populate_l1=False`，只写入 L2 + registry，等后续变热再晋升
 
-        为什么不能只调用 `self.cache.store()`？
-        因为本项目不是只有 L2 semantic cache，还维护了多套 L1 fast path map。
-        只有在这里同时刷新：
-        - `_answer_by_question`
-        - `_seed_id_by_question`
-        - `_normalized_question_map`
-        - `_near_exact_question_map`
-        才能保证“写入一条问答后，所有查询路径看到的是同一份事实”。
+        具体例子：
+        - FAQ seed “你们支持几天无理由退换？”：写入后会同时出现在
+          `_answer_by_question` / `_normalized_question_map` / `_near_exact_question_map`
+          和 RedisVL SemanticCache 中。
+        - 运行时问答 “退货时的物流费用怎么算？”：第一次写入后只会进入
+          registry + L2，不会立刻常驻到 `_answer_by_question` 这些 L1 map 里。
         """
         if not prompt or not answer:
             return
 
+        SemanticCacheWrapper._ensure_runtime_state(self)
         prompt_str = str(prompt)
-        self.cache.store(prompt=prompt_str, response=answer)
-        self._seed_id_by_question[prompt_str] = seed_id
-        self._answer_by_question[prompt_str] = answer
-        # 注意：两个 L1 map 存进去的 value 都是“原问题文本”，不是答案本身。
-        # 这也是为什么 exact_match / near_exact_match 取出来后，还要再去 _answer_by_question 查答案。
-        self._normalized_question_map[self.normalize_query(prompt_str)] = prompt_str
-        self._near_exact_question_map[self.normalize_surface_query(prompt_str)] = prompt_str
+        answer_str = str(answer)
+        self.cache.store(prompt=prompt_str, response=answer_str)
+        SemanticCacheWrapper._register_prompt_in_registry(self, prompt_str)
+
+        if not populate_l1:
+            return
+
+        SemanticCacheWrapper._upsert_l1_prompt(
+            self,
+            prompt_str,
+            answer_str,
+            seed_id=seed_id,
+            pinned=seed_id is not None,
+        )
 
     def contains_prompt_variant(self, prompt: str) -> bool:
-        """判断 `prompt` 的归一化变体是否已经登记在 L1 map 中。
+        """判断 `prompt` 的归一化变体是否已经登记在缓存 registry 中。
 
-        这里检查的是“这个问法的归一化变体是否已经存在”，不是语义相似度判断。
-        典型用途是写回前去重：
-        - 如果只是空格、标点、全半角不同，就没必要再重复存一条
-        - 如果两个问题只是语义相近但字面不同，这里不会把它们视作同一条
+        这里不再只看 L1。原因是运行时新问答现在可能“只在 L2，不在 L1”，
+        如果去重还只检查 L1，就会把同一句 runtime prompt 反复写进 L2。
 
-        因此它是 L1 写回的去重屏障，不是 semantic cache 的召回逻辑。
+        因此它现在更准确地说是“L2-aware 的字面去重屏障”，
+        仍然不是 semantic similarity 判断。
         """
         if not prompt:
             return False
-        if self.normalize_query(prompt) in self._normalized_question_map:
+        SemanticCacheWrapper._ensure_runtime_state(self)
+        if self.normalize_query(prompt) in self._stored_normalized_question_map:
             return True
-        if self.normalize_surface_query(prompt) in self._near_exact_question_map:
+        if self.normalize_surface_query(prompt) in self._stored_near_exact_question_map:
             return True
         return False
 
@@ -390,6 +581,7 @@ class SemanticCacheWrapper:
             # 这样可以保持 prompt / answer / seed_id 三者都以同一个原问题为主键。
             # 也就是说：L1 exact 命中后的最终答案来源，是进程内的 `_answer_by_question`。
             if exact_match:
+                SemanticCacheWrapper._touch_l1_prompt(self, exact_match)
                 print(f"⚡ [精确命中] normalized exact hit: '{query}' -> '{exact_match}'")
                 return CacheResults(query=query, matches=[
                     CacheResult(
@@ -407,6 +599,7 @@ class SemanticCacheWrapper:
             near_exact_query = self.normalize_surface_query(query)
             near_exact_match = self._near_exact_question_map.get(near_exact_query)
             if near_exact_match:
+                SemanticCacheWrapper._touch_l1_prompt(self, near_exact_match)
                 # near_exact 与 exact 一样，真正的答案也来自 `_answer_by_question`，
                 # `_near_exact_question_map` 只负责把变体问法映射回原问题文本。
                 print(f"⚡ [近精确命中] normalized surface hit: '{query}' -> '{near_exact_match}'")
@@ -444,7 +637,7 @@ class SemanticCacheWrapper:
             return CacheResults(query=query, matches=[])
             
         results: List[CacheResult] = []
-        for item in candidates[:num_results]:
+        for index, item in enumerate(candidates[:num_results]):
             result = dict(item)
             # RedisVL 返回的是 vector_distance；工作流层更常用 cosine_similarity 来记录与展示。
             # 这里的 response 已经来自 L2 semantic cache 的候选记录，
@@ -452,8 +645,17 @@ class SemanticCacheWrapper:
             result["vector_distance"] = float(result.get("vector_distance", 0.0))
             result["cosine_similarity"] = float((2 - result["vector_distance"]) / 2)
             result["query"] = query
-            result["seed_id"] = self._seed_id_by_question.get(str(result.get("prompt", "")))
+            result_prompt = str(result.get("prompt", ""))
+            result_response = str(result.get("response", ""))
+            result["seed_id"] = self._seed_id_by_question.get(result_prompt)
             result["match_type"] = "semantic"
+            if index == 0 and result_prompt and result_response:
+                SemanticCacheWrapper._record_semantic_hit(
+                    self,
+                    result_prompt,
+                    result_response,
+                    seed_id=result["seed_id"],
+                )
             results.append(CacheResult(**result))
             
         return CacheResults(query=query, matches=results)

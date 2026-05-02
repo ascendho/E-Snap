@@ -1108,16 +1108,25 @@ def research_supplement_node(state: WorkflowState) -> WorkflowState:
 def _store_cache_entry(prompt: str, answer: str) -> None:
     """Persist a runtime QA pair through the cache wrapper.
 
-    Delegates to `SemanticCacheWrapper.register_entry` so all writers (FAQ seed,
-    synthesize_response writeback, background subquery writeback) share one code path
-    for keeping the L1 lookup maps consistent.
+    Runtime writeback now defaults to "L2 first":
+    - store prompt/answer into RedisVL semantic cache
+    - register prompt variants for dedup
+    - do not immediately pin the QA in L1
+
+    When the same canonical prompt is hit in L2 enough times, engine.check() will
+    promote it into the bounded L1 hot set.
     """
     if not _cache_instance or not prompt or not answer:
         return
 
+    store_runtime_entry = getattr(_cache_instance, "store_runtime_entry", None)
+    if callable(store_runtime_entry):
+        store_runtime_entry(prompt, answer)
+        return
+
     register = getattr(_cache_instance, "register_entry", None)
     if callable(register):
-        register(prompt, answer)
+        register(prompt, answer, populate_l1=False)
         return
 
     # Defensive fallback for any custom cache shim that lacks register_entry.
@@ -1131,14 +1140,20 @@ def _cache_contains_prompt_variant(prompt: str) -> bool:
     if callable(contains):
         return bool(contains(prompt))
 
+    stored_normalized_map = getattr(_cache_instance, '_stored_normalized_question_map', None)
     if hasattr(_cache_instance, 'normalize_query'):
         normalized_prompt = _cache_instance.normalize_query(prompt)
         if normalized_prompt in getattr(_cache_instance, '_normalized_question_map', {}):
             return True
+        if normalized_prompt in (stored_normalized_map or {}):
+            return True
 
+    stored_surface_map = getattr(_cache_instance, '_stored_near_exact_question_map', None)
     if hasattr(_cache_instance, 'normalize_surface_query'):
         normalized_surface_prompt = _cache_instance.normalize_surface_query(prompt)
         if normalized_surface_prompt in getattr(_cache_instance, '_near_exact_question_map', {}):
+            return True
+        if normalized_surface_prompt in (stored_surface_map or {}):
             return True
 
     return False

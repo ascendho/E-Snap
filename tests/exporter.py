@@ -4,6 +4,7 @@ from typing import Dict, List
 
 from tests.result_classifiers import (
     execution_path,
+    is_dual_subquery_reuse,
     is_edit_distance_bypass,
     is_exact_bypass,
     is_near_exact_bypass,
@@ -94,6 +95,7 @@ def export_results(all_results: List[Dict], total_wall_time_sec: float, output_d
     full_reuse_paths = [r for r in eligible_queries if r.get("cache_hit", False) or r.get("cache_reuse_mode") == "full_reuse"]
     research_paths = [r for r in eligible_queries if "researched" in execution_path(r)]
     partial_reuse_paths = [r for r in eligible_queries if is_partial_reuse(r)]
+    dual_subquery_paths = [r for r in eligible_queries if is_dual_subquery_reuse(r)]
     baseline_reference_paths = research_paths or partial_reuse_paths or eligible_queries
     cache_candidates = [r for r in eligible_queries if r.get("cache_matched_question")]
     rerank_candidates = [r for r in eligible_queries if is_rerank_candidate(r)]
@@ -117,6 +119,7 @@ def export_results(all_results: List[Dict], total_wall_time_sec: float, output_d
     intercept_count = len(intercepted_paths)
     direct_cache_reuse_rate = direct_reuse_count / eligible_count if eligible_count > 0 else 0.0
     hybrid_reuse_rate = len(partial_reuse_paths) / eligible_count if eligible_count > 0 else 0.0
+    dual_subquery_rate = len(dual_subquery_paths) / eligible_count if eligible_count > 0 else 0.0
     candidate_hit_rate = candidate_count / eligible_count if eligible_count > 0 else 0.0
     rerank_reuse_rate = len(rerank_reusable_paths) / rerank_candidate_count if rerank_candidate_count > 0 else 0.0
     throughput = total_queries / total_wall_time_sec if total_wall_time_sec > 0 else 0.0
@@ -125,12 +128,14 @@ def export_results(all_results: List[Dict], total_wall_time_sec: float, output_d
     research_latency = avg_latency(research_paths)
     direct_cache_reuse_latency = avg_latency(direct_cache_reuse_paths)
     full_reuse_latency = avg_latency(full_reuse_paths)
+    dual_subquery_latency = avg_latency(dual_subquery_paths)
     intercepted_latency = avg_latency(intercepted_paths)
     avg_precheck_latency = avg_metric(all_results, "precheck_latency")
     avg_cache_check_latency = avg_metric(eligible_queries, "cache_latency")
     avg_rerank_latency = avg_metric(rerank_candidates, "rerank_latency")
     avg_research_stage_latency = avg_metric(research_paths, "research_latency")
     avg_supplement_latency = avg_metric(partial_reuse_paths, "supplement_latency")
+    avg_dual_subquery_supplement_latency = avg_metric(dual_subquery_paths, "supplement_latency")
     avg_synthesis_latency = avg_metric(all_results, "synthesis_latency")
     avg_other_overhead_latency = avg_unattributed_overhead(all_results)
 
@@ -138,6 +143,7 @@ def export_results(all_results: List[Dict], total_wall_time_sec: float, output_d
     research_call_cost = avg_llm_calls(research_paths)
     direct_cache_reuse_call_cost = avg_llm_calls(direct_cache_reuse_paths)
     full_reuse_call_cost = avg_llm_calls(full_reuse_paths)
+    dual_subquery_call_cost = avg_llm_calls(dual_subquery_paths)
     partial_reuse_call_cost = avg_llm_calls(partial_reuse_paths)
     actual_eligible_call_cost = avg_llm_calls(eligible_queries)
     llm_savings_per_request = max(baseline_call_cost - actual_eligible_call_cost, 0.0)
@@ -160,19 +166,23 @@ def export_results(all_results: List[Dict], total_wall_time_sec: float, output_d
     pure_rag_avg_cost_rmb = avg_usage_value(research_paths, "total_cost_rmb")
     direct_cache_reuse_avg_cost_rmb = avg_usage_value(direct_cache_reuse_paths, "total_cost_rmb")
     full_reuse_avg_cost_rmb = avg_usage_value(full_reuse_paths, "total_cost_rmb")
+    dual_subquery_avg_cost_rmb = avg_usage_value(dual_subquery_paths, "total_cost_rmb")
     partial_reuse_avg_cost_rmb = avg_usage_value(partial_reuse_paths, "total_cost_rmb")
     actual_eligible_avg_cost_rmb = avg_usage_value(eligible_queries, "total_cost_rmb")
 
     full_reuse_saved_latency = max(baseline_latency - full_reuse_latency, 0.0) * len(full_reuse_paths)
+    dual_subquery_saved_latency = max(baseline_latency - dual_subquery_latency, 0.0) * len(dual_subquery_paths)
     intercept_saved_latency = max(baseline_latency - intercepted_latency, 0.0) * intercept_count
     partial_reuse_penalty_latency = max(avg_latency(partial_reuse_paths) - baseline_latency, 0.0) * len(partial_reuse_paths)
 
     full_reuse_saved_calls = max(baseline_call_cost - full_reuse_call_cost, 0.0) * len(full_reuse_paths)
+    dual_subquery_saved_calls = max(baseline_call_cost - dual_subquery_call_cost, 0.0) * len(dual_subquery_paths)
     partial_reuse_added_calls = max(partial_reuse_call_cost - baseline_call_cost, 0.0) * len(partial_reuse_paths)
     net_saved_calls_total = max(full_reuse_saved_calls - partial_reuse_added_calls, 0.0)
 
     theory_total_cost_without_cache_rmb = baseline_avg_cost_rmb * eligible_count
     full_reuse_saved_cost_rmb = max(baseline_avg_cost_rmb - full_reuse_avg_cost_rmb, 0.0) * len(full_reuse_paths)
+    dual_subquery_saved_cost_rmb = max(baseline_avg_cost_rmb - dual_subquery_avg_cost_rmb, 0.0) * len(dual_subquery_paths)
     partial_reuse_extra_cost_rmb = max(partial_reuse_avg_cost_rmb - baseline_avg_cost_rmb, 0.0) * len(partial_reuse_paths)
     net_saved_cost_rmb = max(theory_total_cost_without_cache_rmb - actual_eligible_total_cost_rmb, 0.0)
     cost_reduction_ratio = ((theory_total_cost_without_cache_rmb - actual_eligible_total_cost_rmb) / theory_total_cost_without_cache_rmb * 100.0) if theory_total_cost_without_cache_rmb > 0 else 0.0
@@ -191,6 +201,7 @@ def export_results(all_results: List[Dict], total_wall_time_sec: float, output_d
     max_qps = 1000.0 / direct_cache_reuse_latency if direct_cache_reuse_latency > 0 else 0.0
     rerank_latency_text = f"{avg_rerank_latency:.0f} ms ({rerank_candidate_count} 候选)" if rerank_candidate_count > 0 else "N/A (未触发)"
     supplement_latency_text = f"{avg_supplement_latency:.0f} ms ({len(partial_reuse_paths)} 条路径)" if partial_reuse_paths else "N/A (未触发)"
+    dual_subquery_latency_text = f"{avg_dual_subquery_supplement_latency:.0f} ms ({len(dual_subquery_paths)} 条路径)" if dual_subquery_paths else "N/A (未触发)"
 
     report_text = f"""======================================================
          AGENT CACHE PERFORMANCE REPORT
@@ -213,6 +224,8 @@ Reranker full_reuse 数 : {len(reranked_full_reuse_paths)} 次
 partial_reuse 数（单列统计，不计入 direct cache hit） : {len(partial_reuse_paths)} 次
     其中 deterministic subquery partial 数 : {len(deterministic_partial_paths)} 次
     其中 reranker partial 数 : {len(reranked_partial_paths)} 次
+dual_subquery 数（双子问题均来自缓存） : {len(dual_subquery_paths)} 次
+dual_subquery 率 : {dual_subquery_rate * 100:.2f}%
 Reranker reject 数 : {len(reranker_reject_paths)} 次
 Reranker exception 数 : {len(reranker_exception_paths)} 次
 Reranker fallback 数 : {len(reranker_fallback_paths)} 次
@@ -228,10 +241,12 @@ partial_reuse 率 : {hybrid_reuse_rate * 100:.2f}%
 - 平均 Reranker 耗时         : {rerank_latency_text}
 - 平均 Research 阶段耗时     : {avg_research_stage_latency:.0f} ms
 - 平均 Supplement 阶段耗时   : {supplement_latency_text}
+- 平均 Dual Subquery 补充阶段耗时 : {dual_subquery_latency_text}
 - 平均 Synthesis 阶段耗时    : {avg_synthesis_latency:.0f} ms
 - 平均其他未拆分开销         : {avg_other_overhead_latency:.0f} ms
 - 直接缓存复用路径平均总耗时 : {direct_cache_reuse_latency:.0f} ms
 - full_reuse 路径平均总耗时  : {full_reuse_latency:.0f} ms
+- Dual Subquery 路径平均总耗时 : {dual_subquery_latency:.0f} ms
 - 无缓存基线平均总耗时       : {baseline_latency:.0f} ms
 - 前置拦截路径平均总耗时     : {intercepted_latency:.0f} ms
 
@@ -253,6 +268,7 @@ Reranker 可复用率            : {rerank_reuse_rate * 100:.2f}%
 估算无缓存基线总耗时          : {theory_total_time_without_cache:.0f} ms
 实际执行总耗时                : {actual_total_time:.0f} ms
 full_reuse 节省总耗时         : {full_reuse_saved_latency:.0f} ms
+dual_subquery 节省总耗时      : {dual_subquery_saved_latency:.0f} ms
 intercept 节省总耗时          : {intercept_saved_latency:.0f} ms
 partial_reuse 额外耗时         : {partial_reuse_penalty_latency:.0f} ms
 📌 Latency Reduction         : {latency_reduction:.2f}% 
@@ -279,11 +295,13 @@ Research 成本总计              : ￥{total_research_cost_rmb:.6f}
 无缓存基线平均成本            : ￥{baseline_avg_cost_rmb:.6f}
 直接缓存复用平均成本          : ￥{direct_cache_reuse_avg_cost_rmb:.6f}
 full_reuse 平均成本           : ￥{full_reuse_avg_cost_rmb:.6f}
+dual_subquery 平均成本        : ￥{dual_subquery_avg_cost_rmb:.6f}
 partial_reuse 平均成本        : ￥{partial_reuse_avg_cost_rmb:.6f}
 可参与缓存请求平均实际成本     : ￥{actual_eligible_avg_cost_rmb:.6f}
 估算无缓存基线总成本          : ￥{theory_total_cost_without_cache_rmb:.6f}
 实际可参与缓存总成本          : ￥{actual_eligible_total_cost_rmb:.6f}
 full_reuse 节省金额总计       : ￥{full_reuse_saved_cost_rmb:.6f}
+dual_subquery 节省金额总计    : ￥{dual_subquery_saved_cost_rmb:.6f}
 partial_reuse 额外成本总计     : ￥{partial_reuse_extra_cost_rmb:.6f}
 净节省金额总计                : ￥{net_saved_cost_rmb:.6f}
 📌 金额节省比例               : {cost_reduction_ratio:.2f}%
@@ -295,9 +313,11 @@ partial_reuse 额外成本总计     : ￥{partial_reuse_extra_cost_rmb:.6f}
 无缓存基线平均 LLM 调用数     : {baseline_call_cost:.2f} 次
 直接缓存复用平均 LLM 调用数   : {direct_cache_reuse_call_cost:.2f} 次
 full_reuse 平均 LLM 调用数    : {full_reuse_call_cost:.2f} 次
+dual_subquery 平均 LLM 调用数 : {dual_subquery_call_cost:.2f} 次
 partial_reuse 平均 LLM 调用数 : {partial_reuse_call_cost:.2f} 次
 可参与缓存请求平均实际调用数  : {actual_eligible_call_cost:.2f} 次
 full_reuse 节省调用总数       : {full_reuse_saved_calls:.2f} 次
+dual_subquery 节省调用总数    : {dual_subquery_saved_calls:.2f} 次
 partial_reuse 额外调用总数    : {partial_reuse_added_calls:.2f} 次
 净节省调用总数                : {net_saved_calls_total:.2f} 次
 📌 调用节省（相对纯RAG基线）   : {llm_savings_per_request:.2f} 次 / 请求

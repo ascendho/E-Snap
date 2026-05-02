@@ -31,8 +31,16 @@ def is_reranked_full_reuse(result: Dict) -> bool:
     return is_rerank_candidate(result) and result.get("cache_reuse_mode") == "full_reuse"
 
 
+def is_dual_subquery_reuse(result: Dict) -> bool:
+    return result.get("cache_reuse_mode") == "dual_subquery"
+
+
 def is_partial_reuse(result: Dict) -> bool:
-    return result.get("cache_reuse_mode") == "partial_reuse" or "supplement_researched" in execution_path(result)
+    if result.get("cache_reuse_mode") == "partial_reuse":
+        return True
+    if is_dual_subquery_reuse(result):
+        return False
+    return "supplement_researched" in execution_path(result)
 
 
 def is_reranker_exception(result: Dict) -> bool:
@@ -49,6 +57,8 @@ def classify_path(result: Dict) -> str:
         return "近精确缓存直出"
     if is_edit_distance_bypass(result):
         return "编辑距离缓存直出"
+    if is_dual_subquery_reuse(result):
+        return "Dual Subquery Cache Hit"
     if is_reranked_full_reuse(result):
         return "Reranker完整复用"
     if is_partial_reuse(result):

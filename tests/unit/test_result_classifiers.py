@@ -5,6 +5,7 @@ import unittest
 from tests.result_classifiers import (
     classify_path,
     is_edit_distance_bypass,
+    is_dual_subquery_reuse,
     is_exact_bypass,
     is_near_exact_bypass,
     is_partial_reuse,
@@ -76,6 +77,15 @@ class ClassifyPathTests(unittest.TestCase):
         r = _result(execution_path=["pre_check", "supplement_researched"])
         self.assertTrue(is_partial_reuse(r))
         self.assertEqual(classify_path(r), "部分复用+补充研究")
+
+    def test_dual_subquery_is_not_partial_reuse_even_with_supplement_path(self):
+        r = _result(
+            cache_reuse_mode="dual_subquery",
+            execution_path=["pre_check", "supplement_researched"],
+        )
+        self.assertTrue(is_dual_subquery_reuse(r))
+        self.assertFalse(is_partial_reuse(r))
+        self.assertEqual(classify_path(r), "Dual Subquery Cache Hit")
 
     def test_reranker_reject(self):
         r = _result(

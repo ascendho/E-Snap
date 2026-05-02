@@ -127,6 +127,30 @@ def _partial_reuse_result():
     }
 
 
+def _dual_subquery_result():
+    return {
+        "query": "dual subquery",
+        "intercepted": False,
+        "cache_hit": False,
+        "cache_match_type": "subquery_near_exact",
+        "cache_reuse_mode": "dual_subquery",
+        "cache_matched_question": "cached segment",
+        "cache_confidence": 0.99,
+        "cache_rerank_attempt": "skipped",
+        "execution_path": ["pre_check", "supplement_researched"],
+        "llm_calls": {},
+        "llm_usage": {"total_cost_rmb": 0.0},
+        "metrics": {
+            "precheck_latency": 2,
+            "cache_latency": 3,
+            "supplement_latency": 20,
+            "synthesis_latency": 10,
+            "total_latency": 40,
+        },
+        "final_response": "dual cached answer",
+    }
+
+
 class ExporterContractTests(unittest.TestCase):
     def test_csv_columns_match_schema_exactly(self):
         results = [_intercepted_result(), _exact_cache_result(), _full_research_result()]
@@ -234,6 +258,21 @@ class ExporterContractTests(unittest.TestCase):
 
         self.assertIn("估算无缓存基线总耗时          : 1000 ms", text)
         self.assertIn("估算无缓存基线总成本          : ￥0.008000", text)
+
+    def test_perf_report_keeps_dual_subquery_out_of_partial_reuse_metrics(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = export_results(
+                [_partial_reuse_result(), _dual_subquery_result(), _exact_cache_result()],
+                total_wall_time_sec=3.0,
+                output_dir=tmpdir,
+            )
+            with open(paths["perf_metrics_txt"], "r", encoding="utf-8") as f:
+                text = f.read()
+
+        self.assertIn("partial_reuse 数（单列统计，不计入 direct cache hit） : 1 次", text)
+        self.assertIn("dual_subquery 数（双子问题均来自缓存） : 1 次", text)
+        self.assertIn("- 平均 Supplement 阶段耗时   : 400 ms (1 条路径)", text)
+        self.assertIn("- 平均 Dual Subquery 补充阶段耗时 : 20 ms (1 条路径)", text)
 
 
 if __name__ == "__main__":

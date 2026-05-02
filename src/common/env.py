@@ -27,6 +27,13 @@ CACHE_NAME = os.getenv("CACHE_NAME", "semantic-cache")
 # 而是同一套运行时中的逻辑双层封装。
 CACHE_L1_EXACT_ENABLED = os.getenv("CACHE_L1_EXACT_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 CACHE_L1_EDIT_DISTANCE_ENABLED = os.getenv("CACHE_L1_EDIT_DISTANCE_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+CACHE_L1_PROMOTION_ENABLED = os.getenv("CACHE_L1_PROMOTION_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+# L1 只保留 FAQ pinned 项和被证明足够热的运行时问答。
+# 默认阈值为 2，表示某条运行时问答在 L2 被复用两次后，才值得进入 L1 快速路径。
+CACHE_L1_PROMOTION_THRESHOLD = int(os.getenv("CACHE_L1_PROMOTION_THRESHOLD", "2"))
+# `CACHE_L1_MAX_ENTRIES` 的语义是“L1 总预算”。
+# FAQ seed 会以 pinned 形式常驻；剩余预算才分配给运行时热点项。
+CACHE_L1_MAX_ENTRIES = int(os.getenv("CACHE_L1_MAX_ENTRIES", "128"))
 # 默认保持 1 作为安全基线：
 # - 1 足以兜住轻微 typo / OCR 噪声
 # - 更大的阈值更容易把不同中文商品问法误判成同题
