@@ -61,6 +61,12 @@ def search_knowledge_base(query: str, top_k: int = 3) -> str:
 
     Returns:
         一段格式化的字符串，包含检索到的文本内容、层级标题及其相关度分数。
+
+    这不是“直接给用户展示的最终答案”，而是给 research prompt 消费的检索上下文。
+    当前项目使用的是 hybrid retrieval：
+    - Vector KNN 负责语义召回
+    - BM25 负责字面强匹配
+    - 然后做交叉去重合并，给后续 LLM 一个覆盖面更稳的上下文集合
     """
     # 【安全性检查】：确保资源已注入。如果未初始化直接调用，返回提示而非让系统崩溃。
     if not kb_index or not embeddings:

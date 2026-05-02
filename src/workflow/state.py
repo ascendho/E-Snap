@@ -125,7 +125,9 @@ class WorkflowState(TypedDict):
 
     # --- 缓存写回计划（主要由 supplement / synthesize 阶段生产） ---
     # `cache_writeback_entries` 是待写回的问答对清单；
-    # `cache_written_prompts` 是已经确认写回或计划写回的 prompt，用于 UI 展示与去重。
+    # `cache_written_prompts` 是已经确认写回或计划写回的 prompt 列表：
+    # 一方面会进入最终 state / API 响应供前端展示，另一方面会被 synthesize 阶段
+    # 当作“本轮已经处理过哪些 prompt”的外部可观察结果。
     cache_writeback_entries: List[Dict[str, str]]
     cache_written_prompts: List[str]
 

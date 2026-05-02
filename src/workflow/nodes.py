@@ -607,6 +607,15 @@ def _coerce_tool_args(
     *,
     locked_search_query: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """规范化工具参数，并在 supplement 模式下强制锁定检索词。
+
+    正常情况下，tool_args 由 LLM 自己生成；
+    但在 `research_supplement_node()` 中，我们只希望它围绕 residual_query 补缺口，
+    不希望模型又把检索词扩写回原始整题。
+
+    因此当 `locked_search_query` 存在且工具是 `search_knowledge_base` 时，
+    会把实际执行的 query 强制改成 locked_search_query。
+    """
     if isinstance(tool_args, dict):
         normalized_args = tool_args.copy()
     elif tool_args is None:
@@ -785,6 +794,15 @@ def prepare_research_messages(
 ) -> Tuple[List[Any], int, bool]:
     """构造 research 阶段的消息历史。
 
+    这里实现的是一个工程化的 ReAct 式循环：
+    1. LLM 先基于当前消息判断是否需要调用工具
+    2. 若调用工具，就把工具结果追加回消息历史
+    3. LLM 再读取新历史继续推理
+    4. 最多允许 3 轮往返，避免无限工具循环
+
+    因此这个函数返回的不只是“最终答案前的 prompt”，
+    而是一段已经混合了 system / human / ai / tool message 的完整对话历史。
+
     返回值：
     - messages: 已包含工具调用结果的消息序列
     - research_llm_invocations: 已发生的 research_llm 调用次数
@@ -863,7 +881,14 @@ def execute_research(
     locked_search_query: Optional[str] = None,
     research_mode: str = "research",
 ) -> Tuple[str, int]:
-    """执行一次 research 流程，返回最终答案与 LLM 调用次数。"""
+    """执行一次完整的 research 流程，返回最终答案与 LLM 调用次数。
+
+    可以把它理解成 `prepare_research_messages()` 的执行器：
+    - 先跑 ReAct 式工具循环
+    - 如果工具循环结束时最后一条还不是自然语言答案，
+      再补最后一轮纯生成
+    - 最终统一返回答案文本和 research_llm 的调用总数
+    """
     messages, research_llm_invocations, needs_final_generation = prepare_research_messages(
         query,
         prompt_text=prompt_text,
@@ -942,7 +967,17 @@ def research_node(state: WorkflowState) -> WorkflowState:
     }
 
 def research_supplement_node(state: WorkflowState) -> WorkflowState:
-    """节点：只补充缓存未覆盖的缺口问题，并与缓存答案合并。"""
+    """节点：只补充缓存未覆盖的缺口问题，并与缓存答案合并。
+
+    这里有两条分支，必须分开理解：
+    1. B1 缓存短路：如果 residual_query 本身已经在 L1 缓存中，完全不调用 research，
+       直接复用缓存答案。这会把路径标成 `dual_subquery`。
+    2. 真正的 supplement research：只有缺口问题不在缓存里时，才调用一次
+       `execute_research(residual_query, locked_search_query=residual_query)`。
+
+    所以“这是补充研究节点”与“本次没有调用 research”并不矛盾，
+    因为节点名描述的是职责边界，不是每次运行都必然触发的子步骤。
+    """
     start_time = time.perf_counter()
     original_query = state["query"]
     residual_query = state.get("cache_residual_query") or original_query
@@ -952,9 +987,9 @@ def research_supplement_node(state: WorkflowState) -> WorkflowState:
     logger.info(f"🔎 正在补充研究缺口: '{residual_query}'")
     logger.info("   🔒 补充研究仅检索缺口问题，原问题只用于合并答案: '%s'", residual_query)
 
-    # ── 缺口缓存短路：若缺口问题本身已在 L1 缓存中，直接复用，跳过 RAG ──
+    # ── B1 缓存短路：若缺口问题本身已在 L1 缓存中，直接复用，完全跳过 research ──
     # 这就是 dual_subquery 路径的关键：复合问题的两段都已经有缓存，
-    # 此时没必要再次调用 research 模型去“重新发现”已知答案。
+    # 因而这个节点虽然叫 supplement，但本次运行中不会真正发起一次 supplement research。
     supplemental_answer: Optional[str] = None
     research_llm_invocations = 0
     _b1_from_cache = False
@@ -1128,6 +1163,11 @@ def synthesize_response_node(state: WorkflowState) -> WorkflowState:
     - 对用户来说，这里决定最终返回什么文本
     - 对系统来说，这里决定哪些问法 / 子问题应该被写回缓存
 
+        关于“这里会不会调用 LLM”，要分主线程和后台线程看：
+        - 主线程：不直接调用 research_llm，只做输出收口和写回决策
+        - 后台线程：在 Full RAG 的复合问题场景下，可能调用 analysis_llm
+            从合并答案里提取子问题答案，再异步写回缓存
+
     也正因为写回策略集中在这里，cache engine 本身才可以保持相对“无业务”的通用接口。
     """
     start_time = time.perf_counter()  # 记录开始时间
@@ -1140,6 +1180,8 @@ def synthesize_response_node(state: WorkflowState) -> WorkflowState:
     # 获取最核心的答案呈现给用户
     final_response = state['answer']
     executed_paths = set(state.get("execution_path", []))
+    # `cache_written_prompts` 是最终写回到 state 里的用户可观察列表；
+    # 它会告诉前端“这次回答涉及了哪些 prompt 被写入或计划写入缓存”。
     cache_written_prompts: List[str] = []
     normalized_written_prompts = set()
 
@@ -1179,8 +1221,11 @@ def synthesize_response_node(state: WorkflowState) -> WorkflowState:
             _store_cache_entry(state["query"], state["answer"])
             remember_written_prompt(state["query"])
 
-        # written_prompts 仍以完整 query 初始化，用作 dedup 屏障，
-        # 防止子问题段落恰好与完整 query 重复写入。
+        # `written_prompts` 是本函数内部使用的去重集合：
+        # 它存的是归一化后的 prompt，用来保证同一轮写回过程中不会重复写入等价问法。
+        # 和 `cache_written_prompts` 的区别是：
+        # - `written_prompts` 偏内部控制，不直接暴露给前端
+        # - `cache_written_prompts` 偏外部可观察，会进入最终 state / API 响应
         extra_cache_entries = state.get("cache_writeback_entries") or []
         written_prompts = {_normalize_surface_text(state["query"])}
         for entry in extra_cache_entries:
@@ -1195,8 +1240,9 @@ def synthesize_response_node(state: WorkflowState) -> WorkflowState:
             written_prompts.add(normalized_prompt)
 
         # 对 Full RAG 路径，将复合问题中的子问题段落写入缓存（后台异步）。
-        # 每个段落独立调用 RAG 以获取精准答案，在后台 daemon 线程中完成，
-        # 不阻塞主线程，用户可立即接收响应并继续输入。
+        # 这里不是再次调用 research_llm 去重跑 RAG，
+        # 而是让后台线程用 analysis_llm 从“已经生成好的完整答案”里提取每个子问题的相关部分。
+        # 这样既不阻塞主线程，也能把一次复合回答拆解成更细粒度的缓存入口。
         if "researched" in executed_paths:
             pending_segments = []
             for segment in _split_query_segments(state["query"]):

@@ -65,6 +65,12 @@ class SemanticCacheWrapper:
         )
         self._seed_id_by_question: Dict[str, int] = {}
         self._answer_by_question: Dict[str, str] = {}
+        # L1 fast path 的两个 map 都是“归一化后的 query -> 原问题文本”，
+        # 而不是“归一化后的 query -> 答案”。
+        # 这样做的目的，是把“用户当时真实问法”保留为中间层：
+        # 先用归一化 key 找到原问题，再用原问题去 _answer_by_question 查答案。
+        # 这能让缓存层同时兼顾：
+        # 1) 快速查找；2) 保留原始 prompt；3) 让 seed_id / answer / prompt 三者保持同一主键。
         self._normalized_question_map: Dict[str, str] = {}
         self._near_exact_question_map: Dict[str, str] = {}
 
@@ -133,6 +139,8 @@ class SemanticCacheWrapper:
         """
         for segment in self.split_query_segments(query):
             normalized_segment = self.normalize_query(segment)
+            # 这里的 exact_match 仍然是“原问题文本”，不是答案。
+            # 先用归一化后的子问题命中 L1 map，再拿原问题文本去 _answer_by_question 查答案。
             exact_match = self._normalized_question_map.get(normalized_segment)
             if exact_match:
                 print(f"⚡ [子问题命中] exact subquery hit: '{segment}' -> '{exact_match}'")
@@ -162,6 +170,16 @@ class SemanticCacheWrapper:
 
     @staticmethod
     def _levenshtein_distance_with_limit(source: str, target: str, max_distance: int) -> Optional[int]:
+        """计算编辑距离，但只关心“是否仍在可接受上限内”。
+
+        返回值不是 bool，而是：
+        - int: 真实编辑距离，且该距离 <= max_distance
+        - None: 明确超出上限，不值得继续算
+
+        `max_distance` 既是匹配阈值，也是性能剪枝条件：
+        一旦某一整行的最小值已经大于上限，后续就不可能再回到可接受范围，
+        因此可以提前结束，避免在 L1 typo 检查里浪费 CPU。
+        """
         if source == target:
             return 0
         if abs(len(source) - len(target)) > max_distance:
@@ -183,6 +201,8 @@ class SemanticCacheWrapper:
                 current_row.append(current_value)
                 row_min = min(row_min, current_value)
             if row_min > max_distance:
+                # 提前终止：当前整行最小值都已经超出上限，
+                # 说明不可能再得到“距离 <= max_distance”的结果。
                 return None
             previous_row = current_row
 
@@ -190,7 +210,15 @@ class SemanticCacheWrapper:
         return distance if distance <= max_distance else None
 
     def find_edit_distance_candidate(self, query: str) -> Optional[CacheResult]:
-        """用小编辑距离识别错别字、同音字和 OCR 噪声。"""
+        """用小编辑距离识别错别字、同音字和 OCR 噪声。
+
+        它解决的是“同一个问题打错了一两个字”的场景，而不是语义改写：
+        - 例如：商品名错一个字、OCR 少一个标点、输入法误按
+        - 不负责判断“两个不同说法是否语义相近”，那属于 semantic cache / reranker 的职责
+
+        返回值只会是“最佳单候选”或 None，不会返回多个近似问题。
+        这样可以让 L1 fast path 继续保持确定性和低成本。
+        """
         normalized_query = self.normalize_surface_query(query)
         best_match = None
         best_distance = None
@@ -254,10 +282,19 @@ class SemanticCacheWrapper:
     def register_entry(self, prompt: str, answer: str, seed_id: Optional[int] = None) -> None:
         """Write `(prompt, answer)` into the vector store and refresh the L1 lookup maps.
 
-        Single source of truth for cache writes used by `store_batch` (FAQ seed) and by
-        the workflow's runtime writeback path (`_store_cache_entry` in nodes.py).
-        Keeping the four `_*_by_question` maps consistent here means call sites no longer
-        need to know about cache internals.
+        这是整个缓存系统的统一写入口：
+        - FAQ seed 预热时会走这里
+        - workflow 运行时写回缓存时也会走这里
+        - 后台子问题提取后的写回同样走这里
+
+        为什么不能只调用 `self.cache.store()`？
+        因为本项目不是只有 L2 semantic cache，还维护了多套 L1 fast path map。
+        只有在这里同时刷新：
+        - `_answer_by_question`
+        - `_seed_id_by_question`
+        - `_normalized_question_map`
+        - `_near_exact_question_map`
+        才能保证“写入一条问答后，所有查询路径看到的是同一份事实”。
         """
         if not prompt or not answer:
             return
@@ -266,14 +303,20 @@ class SemanticCacheWrapper:
         self.cache.store(prompt=prompt_str, response=answer)
         self._seed_id_by_question[prompt_str] = seed_id
         self._answer_by_question[prompt_str] = answer
+        # 注意：两个 L1 map 存进去的 value 都是“原问题文本”，不是答案本身。
+        # 这也是为什么 exact_match / near_exact_match 取出来后，还要再去 _answer_by_question 查答案。
         self._normalized_question_map[self.normalize_query(prompt_str)] = prompt_str
         self._near_exact_question_map[self.normalize_surface_query(prompt_str)] = prompt_str
 
     def contains_prompt_variant(self, prompt: str) -> bool:
         """True if a normalized form of `prompt` is already registered in L1 maps.
 
-        Used by background subquery writeback to skip prompts that would only re-store an
-        existing exact/near_exact entry.
+        这里检查的是“这个问法的归一化变体是否已经存在”，不是语义相似度判断。
+        典型用途是写回前去重：
+        - 如果只是空格、标点、全半角不同，就没必要再重复存一条
+        - 如果两个问题只是语义相近但字面不同，这里不会把它们视作同一条
+
+        因此它是 L1 写回的去重屏障，不是 semantic cache 的召回逻辑。
         """
         if not prompt:
             return False
@@ -300,6 +343,9 @@ class SemanticCacheWrapper:
         if CACHE_L1_EXACT_ENABLED:
             normalized_query = self.normalize_query(query)
             exact_match = self._normalized_question_map.get(normalized_query)
+            # exact_match 取到的是“原问题文本”，不是答案。
+            # 下一步再用这个原问题文本去 _answer_by_question 里拿答案，
+            # 这样可以保持 prompt / answer / seed_id 三者都以同一个原问题为主键。
             if exact_match:
                 print(f"⚡ [精确命中] normalized exact hit: '{query}' -> '{exact_match}'")
                 return CacheResults(query=query, matches=[
